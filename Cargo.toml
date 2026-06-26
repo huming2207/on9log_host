@@ -1,0 +1,24 @@
+[workspace]
+members = [
+    "on9log-protocol",
+    "on9log-cli",
+    "on9log-capture",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+addr2line = "0.25.1"
+clap = { version = "4.6.1", features = ["derive"] }
+crossterm = "0.29.0"
+goblin = "0.10"
+libc = "0.2"
+sprintf = "0.4.3"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-util", "io-std", "signal"] }
+tokio-serial = "5.5.0"
+crc = "3.4.0"
+rusqlite = { version = "0.40.1", features = ["bundled"] }

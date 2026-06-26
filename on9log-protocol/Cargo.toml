@@ -1,0 +1,12 @@
+[package]
+name = "on9log_protocol"
+version.workspace = true
+edition.workspace = true
+description = "Protocol decoder and ELF symbolication for on9log host tools"
+license.workspace = true
+
+[dependencies]
+addr2line.workspace = true
+crc.workspace = true
+goblin.workspace = true
+sprintf.workspace = true

@@ -1,0 +1,18 @@
+[package]
+name = "on9log_cli"
+version.workspace = true
+edition.workspace = true
+description = "CLI for on9log binary log streams"
+license.workspace = true
+
+[[bin]]
+name = "on9log"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+crossterm.workspace = true
+libc.workspace = true
+on9log_protocol = { path = "../on9log-protocol" }
+tokio.workspace = true
+tokio-serial.workspace = true

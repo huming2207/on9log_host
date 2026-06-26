@@ -1,0 +1,19 @@
+[package]
+name = "on9log-capture"
+version.workspace = true
+edition.workspace = true
+description = "Capture on9log streams to SQLite and replay them against an ELF"
+license.workspace = true
+
+[[bin]]
+name = "on9log-capture"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+crossterm.workspace = true
+libc.workspace = true
+on9log_protocol = { path = "../on9log-protocol" }
+rusqlite.workspace = true
+tokio.workspace = true
+tokio-serial.workspace = true
