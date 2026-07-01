@@ -41,7 +41,7 @@ build:
 test:
   stage: test
   extends: .default-settings
-  image: rust:1.87-bookworm
+  image: rust:bullseye
   needs:
     - build
   before_script:
