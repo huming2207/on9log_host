@@ -16,7 +16,8 @@ CRC, and ELF string strategy. This document only describes the host side.
 ## Goal
 
 Given a UART byte stream emitted by `esp_stdio_log_vfs.c` /
-`on9log_esp_vfs.c`, recover individual typed transport frames, verify them,
+`on9log_esp_vfs.c`, or an equivalent Unix-demo file/stdin stream, recover
+individual typed transport frames, verify them,
 decode on9log binary packets, resolve format/tag strings from the matching
 firmware ELF, and render human-readable colored log output that wraps to the
 current terminal width.
@@ -249,7 +250,7 @@ deframer returns to start-marker hunt mode. For non-streaming on9log packets
 (`payload_len != 0xffff`) the deframer also checks that the payload length
 matches the declared value.
 
-`elf_resolv.rs` parses the firmware ELF with goblin and builds an
+`elf_resolv.rs` parses firmware ELF and Unix ELF/Mach-O images with goblin and builds an
 address-indexed table of string-bearing sections and function symbols. When
 loaded from a path (`ElfStrings::from_path`), it also creates an `addr2line`
 loader for DWARF file/line resolution. It skips NOBITS/SHT_NOBITS sections,
@@ -267,6 +268,14 @@ Format and tag resolution are intentionally separate:
 If multiple matching sections cover the same address and produce different
 strings, lookup fails instead of silently choosing one. When no ELF is supplied,
 or lookup fails, addresses render as `@0x........` / `<fmt @0x........>`.
+
+For Unix host demos, the same resolver also accepts a thin Mach-O executable.
+macOS requires PIE, so `on9log_unix_stdio.c` emits a leading
+`@on9log-image-slide=XXXXXXXX` metadata line in binary mode. File/stdin replay
+consumes that line before deframing and normalizes captured 32-bit pointer IDs
+against the unslid Mach-O section addresses. Linux links only the binary demo
+without PIE, so no slide metadata is needed there. UART mode does not inspect
+or alter this replay-only preamble.
 
 `printf.rs` renders a format string against decoded `Arg` values using the
 `sprintf` crate (`sprintf::vsprintf`), which performs all digit conversion,
@@ -401,15 +410,19 @@ symbolicated. With an ELF loaded from a path, the CLI uses DWARF line info via
 `function at file:line`. Without matching debug info, addresses fall back to
 function+offset or `<unresolved>`.
 
-`main.rs` is the CLI. It uses clap with derive: `-p/--port` (required), `-b/--baud`
-(default 115200), `--elf` (optional firmware ELF path), `--no-color`,
-`-t/--timestamp`, `--width` (0 = auto-detect), `--no-esp-reset`, `-s/--save`,
-and `--log-path`. It loads the ELF up front, builds a tokio runtime, opens the serial port via
+`main.rs` is the CLI. It uses clap with derive and requires exactly one input:
+`-p/--port`, `--log-bin <FILE>`, or `--log-stdin`. UART mode also accepts
+`-b/--baud` (default 115200). Shared options are `--elf` (optional firmware ELF
+path), `--no-color`, `-t/--timestamp`, `--width` (0 = auto-detect),
+`-s/--save`, and `--log-path`. It loads the ELF up front. UART mode builds a
+tokio runtime, opens the serial port via
 `tokio_serial::new(port, baud).open_native_async()`, and by default performs an
 ESP hard reset by releasing DTR/GPIO0, asserting RTS/EN for 100 ms, then
 releasing RTS/EN and waiting another 100 ms. `--no-esp-reset` disables this
-startup reset. The read loop uses 4096-byte chunks and feeds each chunk to the
-deframer. When stdin is a TTY, the CLI also puts stdin into non-canonical,
+startup reset. File and stdin modes use blocking 4096-byte reads and feed the
+same deframer/rendering pipeline; they exit at EOF and never reset an ESP target
+or take over stdin for monitor keys. The UART read loop also uses 4096-byte
+chunks. When stdin is a TTY, the CLI also puts stdin into non-canonical,
 no-echo input mode and exits on the two-key monitor sequence `Ctrl+]` followed
 by `Ctrl+T`. On Unix this preserves output processing, so normal `\n` log output
 continues to render correctly.

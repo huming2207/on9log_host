@@ -17,7 +17,7 @@ This workspace contains three crates:
 | Crate | Type | Description |
 |-------|------|-------------|
 | `on9log-protocol` | library | Decoding pipeline, SLIP+CRC deframer, printf & C++23 rendering, ELF/DWARF resolution, crash backtrace annotation. No async runtime dependency — reusable from `napi-rs` or other bindings. |
-| `on9log-cli` | binary (`on9log`) | Live UART monitor. Opens a serial port, deframes the stream, resolves addresses against an ELF, prints colorized wrapped output with ESP reset and save-to-file support. |
+| `on9log-cli` | binary (`on9log`) | UART monitor and file/stdin stream decoder. Deframes the stream, resolves addresses against an ELF, and prints colorized wrapped output with save-to-file support. |
 | `on9log-capture` | binary (`on9log-capture`) | Split customer/developer workflow. `capture` records the raw transport stream to SQLite (no ELF needed). `decode` replays a capture against an ELF to produce human-readable text. |
 
 ## Quick start
@@ -29,6 +29,13 @@ cargo build --release
 # Live monitor with ELF string resolution
 ./target/release/on9log -p /dev/ttyUSB0 -b 115200 --elf firmware.elf
 
+# Decode a stream captured from the Unix demo. Pass the matching host
+# executable: ELF on Linux, Mach-O on macOS.
+./target/release/on9log --log-bin ../on9log.bin --elf ../build-binary/on9log_unix_demo
+
+# Decode the Unix demo directly through a pipe
+../build-binary/on9log_unix_demo | ./target/release/on9log --log-stdin --elf ../build-binary/on9log_unix_demo
+
 # Capture raw stream (customer — no ELF required)
 ./target/release/on9log-capture capture -p /dev/ttyUSB0 -b 115200 -o session.db
 
@@ -39,20 +46,33 @@ cargo build --release
 ## on9log CLI
 
 ```
-on9log -p <PORT> [-b <BAUD>] [--elf <FILE>] [--no-color] [-t] [--no-esp-reset] [-s] [--log-path <FILE>]
+on9log <--port PORT|--log-bin FILE|--log-stdin> [--elf FILE] [--no-color] [-t] [-s] [--log-path FILE]
 ```
 
 | Flag | Description |
 |------|-------------|
-| `-p, --port` | UART device path (required) |
-| `-b, --baud` | Baud rate (default 115200) |
-| `--elf` | Firmware ELF for format/tag string resolution |
+| `-p, --port` | Read a live UART device |
+| `--log-bin` | Replay a binary stream captured from the logger's stdout |
+| `--log-stdin` | Read a live binary stream from stdin, suitable for shell pipelines |
+| `-b, --baud` | UART baud rate (default 115200; ignored for file/stdin input) |
+| `--elf` | Matching ELF firmware/host executable, or macOS Mach-O host executable, for format/tag resolution |
 | `--no-color` | Disable ANSI color output |
 | `-t, --timestamp` | Prefix each line with local wall-clock time |
 | `--width` | Override terminal width (0 = auto-detect) |
-| `--no-esp-reset` | Skip DTR/RTS reset on startup |
+| `--no-esp-reset` | Skip DTR/RTS reset on UART startup |
 | `-s, --save` | Save decoded text log to file |
 | `--log-path` | Output path for --save (default: `on9log-<unix_ts>.log`) |
+
+Exactly one input option is required. `--log-bin` exits at end-of-file;
+`--log-stdin` exits when its producer closes the pipe. File and stdin input use
+the same streaming deframer, decoder, rendering, timestamps, and save behavior
+as UART input, but do not perform ESP reset or install interactive monitor keys.
+
+On macOS, the binary demo writes one `@on9log-image-slide=...` metadata line
+before its framed stream. Replay consumes this line internally and applies the
+ASLR slide while resolving 32-bit format/tag IDs against the matching Mach-O
+executable; the metadata line is not printed as device output. Linux builds the
+binary demo as non-PIE so its IDs resolve directly against the matching ELF.
 
 Output uses standard ESP-IDF log formatting:
 

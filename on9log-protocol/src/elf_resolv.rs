@@ -1,4 +1,4 @@
-//! Resolve ELF addresses back to their C strings and symbols.
+//! Resolve ELF or Mach-O addresses back to their C strings and symbols.
 //!
 //! The firmware places format strings in `.noload_keep_in_elf.*` sections and
 //! tags in normal read-only sections, then sends only the address. The host
@@ -6,13 +6,16 @@
 //! stored in any section that carries file bytes at that virtual address.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use goblin::{
+    Object,
     elf::{Elf, SectionHeader, sym::STT_FUNC},
+    mach::{Mach, MachO, symbols::N_SECT},
     strtab::Strtab,
 };
 
-/// Address-indexed ELF string table.
+/// Address-indexed executable-image string table.
 ///
 /// Loads an ELF binary and provides address-to-string resolution for format
 /// strings, tags, and function symbols, plus optional DWARF source-location
@@ -24,6 +27,9 @@ pub struct ElfStrings {
     symbols: Vec<Symbol>,
     /// DWARF-backed source location resolver, when this ELF was loaded by path.
     lines: Option<addr2line::Loader>,
+    /// Runtime image slide reduced to the 32-bit address width carried on the
+    /// wire. Zero for ESP ELF images and non-PIE host executables.
+    address_slide: AtomicU32,
 }
 
 /// An ELF section with its virtual-address range and file-backed data.
@@ -71,22 +77,31 @@ struct Symbol {
 }
 
 impl ElfStrings {
-    /// Parse an ELF file from raw bytes (e.g. the Xtensa `.elf` build artifact).
+    /// Parse an ELF or thin Mach-O file from raw bytes.
     ///
     /// Scans all section headers and symbol tables, sorting sections and symbols
     /// by address for binary search at lookup time. Does not load DWARF debug
     /// info; use [`ElfStrings::from_path`] for source-location resolution.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
-        let elf = Elf::parse(bytes).map_err(|e| format!("elf parse: {e}"))?;
-
         let mut sections = Vec::new();
-        for sh in elf.section_headers.iter() {
-            let name = elf.shdr_strtab.get_at(sh.sh_name).unwrap_or_default();
-            collect_section(bytes, sh, name, &mut sections);
-        }
-
         let mut symbols = Vec::new();
-        collect_symbols(&elf, &mut symbols);
+        match Object::parse(bytes).map_err(|e| format!("executable parse: {e}"))? {
+            Object::Elf(elf) => {
+                for sh in &elf.section_headers {
+                    let name = elf.shdr_strtab.get_at(sh.sh_name).unwrap_or_default();
+                    collect_section(bytes, sh, name, &mut sections);
+                }
+                collect_symbols(&elf, &mut symbols);
+            }
+            Object::Mach(Mach::Binary(mach)) => {
+                collect_mach_sections(&mach, &mut sections)?;
+                collect_mach_symbols(&mach, &mut symbols);
+            }
+            Object::Mach(Mach::Fat(_)) => {
+                return Err("fat Mach-O images are not supported; use a thin executable".into());
+            }
+            _ => return Err("unsupported executable format; expected ELF or Mach-O".into()),
+        }
 
         // Sort by start address; drop overlaps by preferring earlier entry.
         sections.sort_by_key(|s| s.addr);
@@ -95,10 +110,11 @@ impl ElfStrings {
             sections,
             symbols,
             lines: None,
+            address_slide: AtomicU32::new(0),
         })
     }
 
-    /// Parse an ELF file from disk and enable DWARF source location lookups.
+    /// Parse an ELF or Mach-O file from disk and enable source location lookups.
     ///
     /// Reads the file, calls [`ElfStrings::from_bytes`], and then loads the
     /// DWARF debug info from the same path for [`resolve_location`](Self::resolve_location).
@@ -118,6 +134,12 @@ impl ElfStrings {
     /// returns `None` (ambiguous).
     pub fn read_cstr(&self, addr: u32) -> Option<&str> {
         self.read_cstr_from(addr, |_| true)
+    }
+
+    /// Set the runtime image slide used to normalize host-process pointers
+    /// before looking them up in an ELF or Mach-O file.
+    pub fn set_address_slide(&self, slide: u32) {
+        self.address_slide.store(slide, Ordering::Relaxed);
     }
 
     /// Read a format string. C macro logs place formats in ESP-IDF's ELF-only
@@ -146,6 +168,7 @@ impl ElfStrings {
     /// Uses binary search over the sorted symbol list. Returns the containing
     /// function name, its base address, and the offset from that base to `addr`.
     pub fn resolve_symbol(&self, addr: u32) -> Option<ResolvedSymbol<'_>> {
+        let addr = addr.wrapping_sub(self.address_slide.load(Ordering::Relaxed));
         let idx = self.symbols.partition_point(|s| s.addr <= addr);
         for i in (0..idx).rev() {
             let sym = &self.symbols[i];
@@ -176,6 +199,7 @@ impl ElfStrings {
     /// enables DWARF lookups). Returns `None` when no DWARF info is available
     /// or the address is not mapped to a known source location.
     pub fn resolve_location(&self, addr: u32) -> Option<SourceLocation> {
+        let addr = addr.wrapping_sub(self.address_slide.load(Ordering::Relaxed));
         let loc = self.lines.as_ref()?.find_location(u64::from(addr)).ok()??;
         let file = loc.file?;
         Some(SourceLocation {
@@ -193,6 +217,7 @@ impl ElfStrings {
     where
         P: Fn(&str) -> bool,
     {
+        let addr = addr.wrapping_sub(self.address_slide.load(Ordering::Relaxed));
         let mut found: Option<&str> = None;
         for sec in self
             .sections
@@ -265,6 +290,53 @@ fn collect_section(file: &[u8], sh: &SectionHeader, name: &str, out: &mut Vec<Se
     });
 }
 
+/// Collect file-backed sections from a thin Mach-O image. on9log's wire IDs
+/// are 32-bit, so the section VM addresses are intentionally reduced to their
+/// low 32 bits. Linux uses a non-PIE demo; macOS replay removes the captured
+/// image slide before lookup.
+fn collect_mach_sections(mach: &MachO<'_>, out: &mut Vec<Section>) -> Result<(), String> {
+    for segment in &mach.segments {
+        for item in segment {
+            let (section, data) = item.map_err(|e| format!("Mach-O section parse: {e}"))?;
+            if data.is_empty() {
+                continue;
+            }
+            let section_name = section.name().unwrap_or_default();
+            let segment_name = section.segname().unwrap_or_default();
+            let name = format!("{segment_name},{section_name}");
+            let addr = section.addr as u32;
+            let size = u32::try_from(data.len()).unwrap_or(u32::MAX);
+            out.push(Section {
+                name,
+                addr,
+                end: addr.saturating_add(size),
+                data: data.to_vec(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Collect defined Mach-O symbols. Mach-O nlist entries do not carry symbol
+/// sizes, so the next symbol address provides the upper bound during lookup.
+fn collect_mach_symbols(mach: &MachO<'_>, out: &mut Vec<Symbol>) {
+    for (name, symbol) in mach.symbols().flatten() {
+        if name.is_empty() || symbol.n_value == 0 || symbol.is_stab() || symbol.get_type() != N_SECT
+        {
+            continue;
+        }
+        let addr = symbol.n_value as u32;
+        if out.iter().any(|s| s.addr == addr && s.name == name) {
+            continue;
+        }
+        out.push(Symbol {
+            name: name.to_string(),
+            addr,
+            size: 0,
+        });
+    }
+}
+
 /// Collect all `STT_FUNC` symbols from both the normal and dynamic symbol
 /// tables, deduplicating by (address, name).
 fn collect_symbols(elf: &Elf<'_>, out: &mut Vec<Symbol>) {
@@ -312,6 +384,13 @@ mod tests {
     }
 
     #[test]
+    fn parses_the_native_test_executable() {
+        let path = std::env::current_exe().unwrap();
+        let strings = ElfStrings::from_path(path).unwrap();
+        assert!(!strings.sections.is_empty());
+    }
+
+    #[test]
     fn format_lookup_uses_noload_section_at_vma_zero() {
         let strings = ElfStrings {
             sections: vec![
@@ -330,6 +409,7 @@ mod tests {
             ],
             symbols: Vec::new(),
             lines: None,
+            address_slide: AtomicU32::new(0),
         };
 
         assert_eq!(strings.read_format(4), Some("fmt"));
@@ -348,10 +428,15 @@ mod tests {
             }],
             symbols: Vec::new(),
             lines: None,
+            address_slide: AtomicU32::new(0),
         };
 
         assert_eq!(strings.read_format(0x3f00_0000), Some("value={}"));
         assert_eq!(strings.read_tag(0x3f00_0009), Some("TAG"));
+
+        strings.set_address_slide(0x0100_0000);
+        assert_eq!(strings.read_format(0x4000_0000), Some("value={}"));
+        assert_eq!(strings.read_tag(0x4000_0009), Some("TAG"));
     }
 
     #[test]
@@ -373,6 +458,7 @@ mod tests {
             ],
             symbols: Vec::new(),
             lines: None,
+            address_slide: AtomicU32::new(0),
         };
 
         assert_eq!(strings.read_format(4), None);
@@ -395,6 +481,7 @@ mod tests {
                 },
             ],
             lines: None,
+            address_slide: AtomicU32::new(0),
         };
 
         assert_eq!(

@@ -1,15 +1,17 @@
 //! `on9log` — host-side CLI for the on9log binary log stream.
 //!
-//! Opens a UART port, deframes typed SLIP+CRC transport frames, decodes on9log
-//! packets against an optional ELF, and prints colorized log lines.
+//! Reads a UART, captured binary stream file, or stdin; deframes typed SLIP+CRC
+//! transport frames; decodes on9log packets against an optional ELF; and
+//! prints colorized log lines.
 
+use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
 use std::ptr;
 use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 use tokio::io::AsyncReadExt;
 use tokio_serial::{SerialPort, SerialPortBuilderExt};
 
@@ -21,17 +23,34 @@ use term::color;
 
 /// Host-side decoder for on9log binary log streams.
 #[derive(Parser, Debug)]
-#[command(name = "on9log", version, about)]
+#[command(
+    name = "on9log",
+    version,
+    about,
+    group(
+        ArgGroup::new("input")
+            .required(true)
+            .args(["port", "log_bin", "log_stdin"])
+    )
+)]
 struct Cli {
-    /// UART port device path, e.g. /dev/ttyUSB0.
+    /// Read from a UART device, e.g. /dev/ttyUSB0.
     #[arg(short, long, value_name = "PORT")]
-    port: String,
+    port: Option<String>,
+
+    /// Replay a binary log stream previously captured from stdout.
+    #[arg(long, value_name = "FILE")]
+    log_bin: Option<PathBuf>,
+
+    /// Read a live binary log stream from stdin.
+    #[arg(long)]
+    log_stdin: bool,
 
     /// Baud rate.
     #[arg(short, long, value_name = "BAUD", default_value_t = 115_200)]
     baud: u32,
 
-    /// Path to the firmware ELF, used to resolve format/tag string addresses.
+    /// Matching ELF or Mach-O image used to resolve format/tag addresses.
     #[arg(long, value_name = "FILE")]
     elf: Option<PathBuf>,
 
@@ -83,11 +102,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let elf = match &cli.elf {
         Some(p) => match ElfStrings::from_path(p) {
             Ok(e) => {
-                eprintln!("on9log: loaded ELF {}", p.display());
+                eprintln!("on9log: loaded image {}", p.display());
                 Some(Rc::new(e))
             }
             Err(e) => {
-                eprintln!("on9log: failed to parse ELF {}: {e}", p.display());
+                eprintln!("on9log: failed to parse image {}: {e}", p.display());
                 None
             }
         },
@@ -102,19 +121,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-    rt.block_on(run(RunConfig {
-        port: cli.port,
-        baud: cli.baud,
-        elf,
-        use_color,
-        width,
-        timestamp: cli.timestamp,
-        esp_reset: !cli.no_esp_reset,
-        save,
-    }))?;
+    if let Some(port) = cli.port {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        rt.block_on(run(RunConfig {
+            port,
+            baud: cli.baud,
+            elf,
+            use_color,
+            width,
+            timestamp: cli.timestamp,
+            esp_reset: !cli.no_esp_reset,
+            save,
+        }))?;
+    } else if let Some(path) = cli.log_bin {
+        let file =
+            File::open(&path).map_err(|e| format!("opening binary log {}: {e}", path.display()))?;
+        run_reader(
+            ReplayConfig {
+                elf,
+                use_color,
+                width,
+                timestamp: cli.timestamp,
+                save,
+            },
+            file,
+            &format!("binary log {}", path.display()),
+        )?;
+    } else if cli.log_stdin {
+        let stdin = std::io::stdin();
+        run_reader(
+            ReplayConfig {
+                elf,
+                use_color,
+                width,
+                timestamp: cli.timestamp,
+                save,
+            },
+            stdin.lock(),
+            "stdin",
+        )?;
+    } else {
+        unreachable!("clap requires exactly one input source");
+    }
     Ok(())
 }
 
@@ -137,6 +187,78 @@ struct RunConfig {
     esp_reset: bool,
     /// Optional text-file logger for saving decoded output.
     save: Option<SaveLog>,
+}
+
+/// Configuration used only by file and stdin replay. Serial-specific settings
+/// intentionally remain in [`RunConfig`] and the original UART event loop.
+struct ReplayConfig {
+    elf: Option<Rc<ElfStrings>>,
+    use_color: bool,
+    width: usize,
+    timestamp: bool,
+    save: Option<SaveLog>,
+}
+
+const IMAGE_SLIDE_PREFIX: &[u8] = b"@on9log-image-slide=";
+
+/// Startup-only parser for the macOS host demo's image-slide metadata line.
+/// Non-matching input is passed through unchanged to the normal deframer.
+struct ReplayPreamble {
+    pending: Vec<u8>,
+    decided: bool,
+}
+
+enum ReplayPreambleResult {
+    Pending,
+    Data(Vec<u8>),
+    ImageSlide(u32, Vec<u8>),
+}
+
+impl ReplayPreamble {
+    fn new() -> Self {
+        Self {
+            pending: Vec::new(),
+            decided: false,
+        }
+    }
+
+    fn feed(&mut self, bytes: &[u8]) -> ReplayPreambleResult {
+        self.pending.extend_from_slice(bytes);
+
+        if self.pending.len() <= IMAGE_SLIDE_PREFIX.len()
+            && IMAGE_SLIDE_PREFIX.starts_with(&self.pending)
+        {
+            return ReplayPreambleResult::Pending;
+        }
+
+        if self.pending.starts_with(IMAGE_SLIDE_PREFIX) {
+            if let Some(newline) = self.pending.iter().position(|&b| b == b'\n') {
+                let value = &self.pending[IMAGE_SLIDE_PREFIX.len()..newline];
+                if let Ok(value) = std::str::from_utf8(value)
+                    && let Ok(slide) = u32::from_str_radix(value, 16)
+                {
+                    let remaining = self.pending.split_off(newline + 1);
+                    self.pending.clear();
+                    self.decided = true;
+                    return ReplayPreambleResult::ImageSlide(slide, remaining);
+                }
+            } else if self.pending.len() < 128 {
+                return ReplayPreambleResult::Pending;
+            }
+        }
+
+        self.decided = true;
+        ReplayPreambleResult::Data(std::mem::take(&mut self.pending))
+    }
+
+    fn finish(&mut self) -> Option<Vec<u8>> {
+        if self.pending.is_empty() {
+            None
+        } else {
+            self.decided = true;
+            Some(std::mem::take(&mut self.pending))
+        }
+    }
 }
 
 /// Main async event loop: opens the serial port, optionally resets the ESP
@@ -215,6 +337,100 @@ async fn run(mut cfg: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+/// Read a finite or piped byte stream and feed it through the same deframer and
+/// renderer used by the serial monitor.
+fn run_reader<R: std::io::Read>(
+    mut cfg: ReplayConfig,
+    mut reader: R,
+    source: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut deframer = Deframer::new();
+    let mut state = DecodeState::new();
+    let mut buf = [0u8; 4096];
+    let mut preamble = ReplayPreamble::new();
+    let opts = RenderOptions {
+        use_color: cfg.use_color,
+        width: cfg.width,
+        timestamp: cfg.timestamp,
+    };
+
+    eprintln!("on9log: reading from {source} (width {})", cfg.width);
+    if let Some(save) = cfg.save.as_ref() {
+        eprintln!("on9log: saving decoded log to {}", save.path.display());
+    }
+
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        if preamble.decided {
+            process_input_bytes(
+                &buf[..n],
+                &mut deframer,
+                &mut state,
+                cfg.elf.as_deref(),
+                opts,
+                cfg.save.as_mut(),
+            );
+            continue;
+        }
+
+        match preamble.feed(&buf[..n]) {
+            ReplayPreambleResult::Pending => {}
+            ReplayPreambleResult::Data(data) => process_input_bytes(
+                &data,
+                &mut deframer,
+                &mut state,
+                cfg.elf.as_deref(),
+                opts,
+                cfg.save.as_mut(),
+            ),
+            ReplayPreambleResult::ImageSlide(slide, data) => {
+                if let Some(elf) = cfg.elf.as_deref() {
+                    elf.set_address_slide(slide);
+                    eprintln!("on9log: applied host image slide 0x{slide:08x}");
+                }
+                process_input_bytes(
+                    &data,
+                    &mut deframer,
+                    &mut state,
+                    cfg.elf.as_deref(),
+                    opts,
+                    cfg.save.as_mut(),
+                );
+            }
+        }
+    }
+
+    if let Some(data) = preamble.finish() {
+        process_input_bytes(
+            &data,
+            &mut deframer,
+            &mut state,
+            cfg.elf.as_deref(),
+            opts,
+            cfg.save.as_mut(),
+        );
+    }
+
+    Ok(())
+}
+
+/// Feed one arbitrary input chunk through the shared deframer/decode path.
+fn process_input_bytes(
+    bytes: &[u8],
+    deframer: &mut Deframer,
+    state: &mut DecodeState,
+    elf: Option<&ElfStrings>,
+    opts: RenderOptions,
+    mut save: Option<&mut SaveLog>,
+) {
+    for outcome in deframer.feed(bytes) {
+        handle_outcome(outcome, state, elf, opts, save.as_deref_mut());
+    }
 }
 
 /// A text log file that mirrors decoded output, with synchronous writes and
@@ -853,6 +1069,71 @@ fn local_timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_accepts_binary_log_file_input() {
+        let cli = Cli::try_parse_from(["on9log", "--log-bin", "capture.bin"]).unwrap();
+        assert_eq!(cli.log_bin, Some(PathBuf::from("capture.bin")));
+        assert!(cli.port.is_none());
+        assert!(!cli.log_stdin);
+    }
+
+    #[test]
+    fn cli_preserves_serial_port_and_baud_input() {
+        let cli = Cli::try_parse_from([
+            "on9log",
+            "--port",
+            "/dev/tty.usbserial-test",
+            "--baud",
+            "921600",
+            "--no-esp-reset",
+        ])
+        .unwrap();
+        assert_eq!(cli.port.as_deref(), Some("/dev/tty.usbserial-test"));
+        assert_eq!(cli.baud, 921_600);
+        assert!(cli.no_esp_reset);
+        assert!(cli.log_bin.is_none());
+        assert!(!cli.log_stdin);
+    }
+
+    #[test]
+    fn cli_accepts_stdin_input() {
+        let cli = Cli::try_parse_from(["on9log", "--log-stdin"]).unwrap();
+        assert!(cli.log_stdin);
+        assert!(cli.port.is_none());
+        assert!(cli.log_bin.is_none());
+    }
+
+    #[test]
+    fn cli_requires_exactly_one_input() {
+        assert!(Cli::try_parse_from(["on9log"]).is_err());
+        assert!(Cli::try_parse_from(["on9log", "--port", "/dev/ttyUSB0", "--log-stdin",]).is_err());
+    }
+
+    #[test]
+    fn replay_preamble_parses_split_image_slide() {
+        let mut preamble = ReplayPreamble::new();
+        assert!(matches!(
+            preamble.feed(b"@on9log-image-"),
+            ReplayPreambleResult::Pending
+        ));
+        match preamble.feed(b"slide=0123abcd\n\xa5rest") {
+            ReplayPreambleResult::ImageSlide(slide, data) => {
+                assert_eq!(slide, 0x0123_abcd);
+                assert_eq!(data, b"\xa5rest");
+            }
+            _ => panic!("expected image-slide metadata"),
+        }
+    }
+
+    #[test]
+    fn replay_preamble_preserves_normal_binary_input() {
+        let mut preamble = ReplayPreamble::new();
+        match preamble.feed(b"\xa5\x01binary") {
+            ReplayPreambleResult::Data(data) => assert_eq!(data, b"\xa5\x01binary"),
+            _ => panic!("expected normal input passthrough"),
+        }
+    }
 
     #[test]
     fn timestamps_each_plain_text_line() {
