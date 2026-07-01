@@ -11,8 +11,7 @@ stages:
 .default-settings:
   interruptible: true
   tags:
-    - linux
-    - x86_64
+    - longrunning
 
 variables:
   CARGO_HOME: ${CI_PROJECT_DIR}/.cargo
