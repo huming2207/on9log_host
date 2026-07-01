@@ -24,7 +24,7 @@ variables:
 build:
   stage: build
   extends: .default-settings
-  image: rust:1.87-bookworm
+  image: rust:bullseye
   before_script:
     - rustup component add clippy
   script:
