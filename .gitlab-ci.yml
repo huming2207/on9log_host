@@ -1,0 +1,52 @@
+# on9log-host GitLab CI — Rust workspace build + test
+#
+# Builds on9log-protocol, on9log-cli, on9log-capture.
+#
+# Rust edition 2024 requires rustc 1.85+.
+
+stages:
+  - build
+  - test
+
+.default-settings:
+  interruptible: true
+  tags:
+    - linux
+    - x86_64
+
+variables:
+  CARGO_HOME: ${CI_PROJECT_DIR}/.cargo
+  CARGO_TARGET_DIR: ${CI_PROJECT_DIR}/target
+  CARGO_INCREMENTAL: 0
+
+# ---------------------------------------------------------------------------
+# Build
+# ---------------------------------------------------------------------------
+build:
+  stage: build
+  extends: .default-settings
+  image: rust:1.87-bookworm
+  before_script:
+    - rustup component add clippy
+  script:
+    - cargo build --release
+  artifacts:
+    paths:
+      - target/release/on9log
+      - target/release/on9log-capture
+    expire_in: 1 day
+
+# ---------------------------------------------------------------------------
+# Test + lint
+# ---------------------------------------------------------------------------
+test:
+  stage: test
+  extends: .default-settings
+  image: rust:1.87-bookworm
+  needs:
+    - build
+  before_script:
+    - rustup component add clippy
+  script:
+    - cargo test --workspace
+    - cargo clippy --workspace --lib --bins --tests -- -D warnings

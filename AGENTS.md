@@ -7,8 +7,9 @@ protocol library crate and a CLI binary crate:
 - `on9log_protocol` implements the decoding pipeline, crash text recognizer,
   printf rendering, and ELF/DWARF resolution with no async runtime dependency,
   so it can be reused by a future `napi-rs` binding for programmatic access;
-- `on9log_cli` builds the `on9log` binary, opens a UART port, handles command
-  line parsing/reset/timestamps, and prints colorized terminal output.
+- `on9log_cli` builds the `on9log` binary, selects UART/file/stdin input,
+  handles command-line parsing/reset/timestamps, and prints colorized terminal
+  output. UART retains the original async monitor path; replay is separate.
 
 See the parent `../AGENTS.md` for the firmware-side packet format, SLIP framing,
 CRC, and ELF string strategy. This document only describes the host side.
@@ -720,22 +721,33 @@ decoding.
 ## Building And Running
 
 ```bash
-cd host_cli
+cd on9log_host
 cargo build --release
 
-# basic usage
+# original UART monitor path
 ./target/release/on9log -p /dev/ttyUSB0 -b 115200
 
 # with ELF string resolution
 ./target/release/on9log -p /dev/ttyUSB0 -b 115200 --elf ../build/myapp.elf
+
+# replay a Unix demo capture (matching ELF on Linux, Mach-O on macOS)
+./target/release/on9log --log-bin ../on9log.bin \
+    --elf ../build-binary/on9log_unix_demo
+
+# stream the Unix demo directly
+../build-binary/on9log_unix_demo | \
+    ./target/release/on9log --log-stdin \
+    --elf ../build-binary/on9log_unix_demo
 ```
 
 CLI flags:
 
 ```text
--p, --port <PORT>     UART device path (e.g. /dev/ttyUSB0)        required
+-p, --port <PORT>     read a UART device (e.g. /dev/ttyUSB0)
+    --log-bin <FILE>  replay a captured binary stdout stream
+    --log-stdin       read a live binary stream from stdin
 -b, --baud <BAUD>     baud rate                                    default 115200
-    --elf <FILE>      firmware ELF for format/tag string resolution
+    --elf <FILE>      matching firmware/host ELF or host Mach-O image
     --no-color        disable colored output
 -t, --timestamp       prefix logs/text lines with local wall time
     --width <WIDTH>   override terminal width (0 = auto-detect)    default 0
@@ -744,13 +756,21 @@ CLI flags:
     --log-path <FILE> path for --save output; default on9log-UNIX_TIMESTAMP.log
 ```
 
+Exactly one of `--port`, `--log-bin`, or `--log-stdin` is required. The UART
+path retains the original `RunConfig { port, baud, esp_reset, ... }`, tokio
+serial open/reset sequence, asynchronous read loop, terminal input guard, and
+`Ctrl+] Ctrl+T` quit sequence. Replay uses a separate `ReplayConfig` and never
+resets a target or takes over stdin for monitor keys. There is CLI regression
+coverage for the original port, baud, and no-reset arguments; physical UART
+behavior still requires hardware testing.
+
 Tests:
 
 ```bash
 cargo test --workspace
                  # CRC, sprintf rendering, framing/raw text, crash decode,
                  # ELF resolution, terminal wrapping, and CLI helpers
-cargo clippy     # 0 warnings
+cargo clippy --workspace --lib --bins -- -D warnings
 ```
 
 ## Future Work
@@ -762,5 +782,5 @@ cargo clippy     # 0 warnings
   boot-relative `time_ms` to UTC.
 - Optional sequence-gap statistics / loss-rate reporting.
 - Optional JSON output mode for piping into other tooling.
-- TCP / WebSocket transport sources alongside UART (the decoder is transport-
-  agnostic; only `on9log-cli/src/main.rs` is UART-specific).
+- TCP / WebSocket transport sources alongside UART/file/stdin (the decoder is
+  transport-agnostic; `on9log-cli/src/main.rs` owns transport selection).

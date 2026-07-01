@@ -17,7 +17,7 @@ This workspace contains three crates:
 | Crate | Type | Description |
 |-------|------|-------------|
 | `on9log-protocol` | library | Decoding pipeline, SLIP+CRC deframer, printf & C++23 rendering, ELF/DWARF resolution, crash backtrace annotation. No async runtime dependency — reusable from `napi-rs` or other bindings. |
-| `on9log-cli` | binary (`on9log`) | UART monitor and file/stdin stream decoder. Deframes the stream, resolves addresses against an ELF, and prints colorized wrapped output with save-to-file support. |
+| `on9log-cli` | binary (`on9log`) | UART monitor and file/stdin stream decoder. Deframes the stream, resolves addresses against an ELF or Mach-O image, and prints colorized wrapped output with save-to-file support. |
 | `on9log-capture` | binary (`on9log-capture`) | Split customer/developer workflow. `capture` records the raw transport stream to SQLite (no ELF needed). `decode` replays a capture against an ELF to produce human-readable text. |
 
 ## Quick start
@@ -67,6 +67,14 @@ Exactly one input option is required. `--log-bin` exits at end-of-file;
 `--log-stdin` exits when its producer closes the pipe. File and stdin input use
 the same streaming deframer, decoder, rendering, timestamps, and save behavior
 as UART input, but do not perform ESP reset or install interactive monitor keys.
+
+The existing UART implementation remains the default hardware workflow:
+`--port` still carries its port and baud into the original tokio-serial event
+loop, performs the same optional DTR/RTS reset, and retains the `Ctrl+] Ctrl+T`
+quit sequence. Replay is implemented in a separate blocking reader path so
+file/stdin support does not retrofit the UART loop. CLI tests cover the original
+port, baud, and `--no-esp-reset` parsing; real serial behavior still requires a
+connected device for verification.
 
 On macOS, the binary demo writes one `@on9log-image-slide=...` metadata line
 before its framed stream. Replay consumes this line internally and applies the

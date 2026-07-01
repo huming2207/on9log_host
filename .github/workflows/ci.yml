@@ -1,0 +1,60 @@
+name: CI
+
+# on9log-host — Rust workspace build + test
+#
+# Builds on9log-protocol, on9log-cli, on9log-capture.
+#
+# Rust edition 2024 requires rustc 1.85+.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+
+  build-test:
+    name: "Build + test + lint (stable)"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Lint
+        run: cargo clippy --workspace --lib --bins --tests -- -D warnings
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: on9log-host-tools-linux-x86_64
+          path: |
+            target/release/on9log
+            target/release/on9log-capture
+          retention-days: 1
