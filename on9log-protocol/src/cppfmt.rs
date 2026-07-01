@@ -955,11 +955,17 @@ mod tests {
         // value=arg0, precision=arg1. The float case needs an explicit `:f`
         // type char — plain `{}` on a U64 renders the raw bits as an integer
         // (the wire carries no int/float distinction; see known limitations).
-        assert_eq!(render("{:.{}f}", &[f(3.14159), Arg::U32(2)]), "3.14");
+        assert_eq!(
+            render("{:.{}f}", &[f(std::f64::consts::PI), Arg::U32(2)]),
+            "3.14"
+        );
         assert_eq!(render("{:.{}s}", &[s("foobar"), Arg::U32(3)]), "foo");
         // value=arg0 (float via :f), width=arg1, precision=arg2
         assert_eq!(
-            render("[{:{}.{}f}]", &[f(3.14159), Arg::U32(8), Arg::U32(2)]),
+            render(
+                "[{:{}.{}f}]",
+                &[f(std::f64::consts::PI), Arg::U32(8), Arg::U32(2)]
+            ),
             "[    3.14]"
         );
         // value=arg0 (int), width=arg1, precision=arg2 (min digits)
@@ -972,7 +978,10 @@ mod tests {
     #[test]
     fn dynamic_width_precision_explicit() {
         assert_eq!(render("{0:{1}}", &[Arg::U32(42), Arg::U32(5)]), "   42");
-        assert_eq!(render("{0:.{1}f}", &[f(3.14159), Arg::U32(2)]), "3.14");
+        assert_eq!(
+            render("{0:.{1}f}", &[f(std::f64::consts::PI), Arg::U32(2)]),
+            "3.14"
+        );
         // reuse: value and width both reference arg 0
         assert_eq!(render("{0:{0}}", &[Arg::U32(5)]), "    5");
     }
@@ -1059,7 +1068,7 @@ mod tests {
     fn complex_combined() {
         let r = render(
             "[{:>8.2f}] {:s}={:#06x}",
-            &[f(3.14159), s("id"), Arg::U32(0xab)],
+            &[f(std::f64::consts::PI), s("id"), Arg::U32(0xab)],
         );
         assert_eq!(r, "[    3.14] id=0x00ab");
     }
