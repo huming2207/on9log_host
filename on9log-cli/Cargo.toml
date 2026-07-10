@@ -4,15 +4,18 @@ version.workspace = true
 edition.workspace = true
 description = "CLI for on9log binary log streams"
 license.workspace = true
+build = "build.rs"
 
 [[bin]]
 name = "on9log"
 path = "src/main.rs"
 
 [dependencies]
+axum.workspace = true
 clap.workspace = true
 crossterm.workspace = true
 libc.workspace = true
 on9log_protocol = { path = "../on9log-protocol" }
+serde.workspace = true
 tokio.workspace = true
 tokio-serial.workspace = true
