@@ -6,7 +6,9 @@
 
 use std::fs::File;
 use std::io::Write;
+use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::process::Command;
 use std::ptr;
 use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -18,6 +20,7 @@ use tokio_serial::{SerialPort, SerialPortBuilderExt};
 use on9log_protocol::{CrashDecoder, DecodedPacket, Decoder, Deframer, ElfStrings, Level, Outcome};
 
 mod term;
+mod web;
 
 use term::color;
 
@@ -77,6 +80,17 @@ struct Cli {
     /// Path for --save output; defaults to on9log-UNIX_TIMESTAMP.log.
     #[arg(long, value_name = "FILE", requires = "save")]
     log_path: Option<PathBuf>,
+
+    /// Start an Axum HTTP/WebSocket server; default 127.0.0.1:9090, +1 if busy.
+    #[arg(
+        long,
+        value_name = "ADDR",
+        num_args = 0..=1,
+        default_missing_value = "127.0.0.1:9090",
+        requires = "port",
+        conflicts_with_all = ["log_bin", "log_stdin"]
+    )]
+    web: Option<SocketAddr>,
 }
 
 /// Map an on9log [`Level`] to the corresponding ANSI color constant.
@@ -134,6 +148,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             timestamp: cli.timestamp,
             esp_reset: !cli.no_esp_reset,
             save,
+            web_bind: cli.web,
         }))?;
     } else if let Some(path) = cli.log_bin {
         let file =
@@ -168,6 +183,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn open_browser_best_effort(url: &str) {
+    let _ = browser_open_command(url).spawn();
+}
+
+#[cfg(target_os = "macos")]
+fn browser_open_command(url: &str) -> Command {
+    let mut cmd = Command::new("open");
+    cmd.arg(url);
+    cmd
+}
+
+#[cfg(target_os = "windows")]
+fn browser_open_command(url: &str) -> Command {
+    let mut cmd = Command::new("cmd");
+    cmd.args(["/C", "start", "", url]);
+    cmd
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+fn browser_open_command(url: &str) -> Command {
+    let mut cmd = Command::new("xdg-open");
+    cmd.arg(url);
+    cmd
+}
+
 /// Runtime configuration assembled from [`Cli`] arguments before entering the
 /// async event loop.
 struct RunConfig {
@@ -187,6 +227,8 @@ struct RunConfig {
     esp_reset: bool,
     /// Optional text-file logger for saving decoded output.
     save: Option<SaveLog>,
+    /// Optional bind address for the Axum REST/WebSocket companion server.
+    web_bind: Option<SocketAddr>,
 }
 
 /// Configuration used only by file and stdin replay. Serial-specific settings
@@ -269,7 +311,7 @@ impl ReplayPreamble {
 /// Returns an error if the serial port cannot be opened, the ESP reset fails,
 /// or an unrecoverable I/O error occurs during the read loop.
 async fn run(mut cfg: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let port = cfg.port;
+    let port = cfg.port.clone();
     let baud = cfg.baud;
     let mut serial = tokio_serial::new(&port, baud)
         .open_native_async()
@@ -286,6 +328,25 @@ async fn run(mut cfg: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
     let mut monitor_keys = MonitorKeyState::new();
     let mut stdin = tokio::io::stdin();
     let raw_input = RawInputGuard::enter_if_interactive();
+    let (web_log, mut web_control_rx) = if let Some(bind) = cfg.web_bind {
+        let (logs, control_tx, control_rx) = web::channel();
+        let addr = web::spawn(web::WebConfig {
+            bind,
+            port: port.clone(),
+            baud,
+            logs: logs.clone(),
+            control_tx,
+        })
+        .await
+        .map_err(|e| format!("starting web server on {bind}: {e}"))?;
+        let web_url = format!("http://{addr}/");
+        eprintln!("on9log: web server listening on {web_url}");
+        eprintln!("on9log: websocket decoded log stream at ws://{addr}/ws/logs");
+        open_browser_best_effort(&web_url);
+        (Some(logs), Some(control_rx))
+    } else {
+        (None, None)
+    };
 
     eprintln!(
         "on9log: listening on {port} @ {baud} baud (width {width}, esp-reset {}, quit Ctrl+] Ctrl+T)",
@@ -306,6 +367,17 @@ async fn run(mut cfg: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
         let n = if raw_input.is_active() {
             tokio::select! {
                 serial_read = serial.read(&mut buf) => serial_read?,
+                cmd = async {
+                    web_control_rx.as_mut().expect("web control receiver").recv().await
+                }, if web_control_rx.is_some() => {
+                    match cmd {
+                        Some(cmd) => {
+                            handle_serial_control(&mut serial, &mut state, cmd).await;
+                        }
+                        None => web_control_rx = None,
+                    }
+                    continue;
+                }
                 stdin_read = stdin.read(&mut stdin_buf) => {
                     let n = stdin_read?;
                     if n == 0 {
@@ -319,7 +391,20 @@ async fn run(mut cfg: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         } else {
-            serial.read(&mut buf).await?
+            tokio::select! {
+                serial_read = serial.read(&mut buf) => serial_read?,
+                cmd = async {
+                    web_control_rx.as_mut().expect("web control receiver").recv().await
+                }, if web_control_rx.is_some() => {
+                    match cmd {
+                        Some(cmd) => {
+                            handle_serial_control(&mut serial, &mut state, cmd).await;
+                        }
+                        None => web_control_rx = None,
+                    }
+                    continue;
+                }
+            }
         };
         if n == 0 {
             // EOF on the device; stop.
@@ -332,6 +417,7 @@ async fn run(mut cfg: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
                 cfg.elf.as_deref(),
                 opts,
                 cfg.save.as_mut(),
+                web_log.as_ref(),
             );
         }
     }
@@ -374,6 +460,7 @@ fn run_reader<R: std::io::Read>(
                 cfg.elf.as_deref(),
                 opts,
                 cfg.save.as_mut(),
+                None,
             );
             continue;
         }
@@ -387,6 +474,7 @@ fn run_reader<R: std::io::Read>(
                 cfg.elf.as_deref(),
                 opts,
                 cfg.save.as_mut(),
+                None,
             ),
             ReplayPreambleResult::ImageSlide(slide, data) => {
                 if let Some(elf) = cfg.elf.as_deref() {
@@ -400,6 +488,7 @@ fn run_reader<R: std::io::Read>(
                     cfg.elf.as_deref(),
                     opts,
                     cfg.save.as_mut(),
+                    None,
                 );
             }
         }
@@ -413,6 +502,7 @@ fn run_reader<R: std::io::Read>(
             cfg.elf.as_deref(),
             opts,
             cfg.save.as_mut(),
+            None,
         );
     }
 
@@ -427,9 +517,10 @@ fn process_input_bytes(
     elf: Option<&ElfStrings>,
     opts: RenderOptions,
     mut save: Option<&mut SaveLog>,
+    web_log: Option<&web::LogSender>,
 ) {
     for outcome in deframer.feed(bytes) {
-        handle_outcome(outcome, state, elf, opts, save.as_deref_mut());
+        handle_outcome(outcome, state, elf, opts, save.as_deref_mut(), web_log);
     }
 }
 
@@ -627,6 +718,40 @@ fn esp_hard_reset<P: SerialPort>(port: &mut P) -> tokio_serial::Result<()> {
     Ok(())
 }
 
+async fn handle_serial_control<P: SerialPort>(
+    port: &mut P,
+    state: &mut DecodeState,
+    command: web::ControlCommand,
+) {
+    match command {
+        web::ControlCommand::Reset { reply } => {
+            let result = esp_hard_reset(port).map_err(|e| e.to_string());
+            if result.is_ok() {
+                state.reset_after_target_reset();
+            }
+            let _ = reply.send(result);
+        }
+        web::ControlCommand::SetLines { dtr, rts, reply } => {
+            let result = set_serial_lines(port, dtr, rts).map_err(|e| e.to_string());
+            let _ = reply.send(result);
+        }
+    }
+}
+
+fn set_serial_lines<P: SerialPort>(
+    port: &mut P,
+    dtr: Option<bool>,
+    rts: Option<bool>,
+) -> tokio_serial::Result<()> {
+    if let Some(dtr) = dtr {
+        port.write_data_terminal_ready(dtr)?;
+    }
+    if let Some(rts) = rts {
+        port.write_request_to_send(rts)?;
+    }
+    Ok(())
+}
+
 /// Rendering configuration passed to `handle_outcome()`.
 #[derive(Clone, Copy)]
 struct RenderOptions {
@@ -651,6 +776,9 @@ struct DecodeState {
     /// Separate plain-text state for the save-file path (tracks ANSI stripping
     /// independently).
     save_plain_text: PlainTextState,
+    /// Plain-text state for websocket broadcast. ANSI is stripped before
+    /// shipping browser-facing text.
+    web_plain_text: PlainTextState,
 }
 
 impl DecodeState {
@@ -661,7 +789,16 @@ impl DecodeState {
             plain_text: PlainTextState::new(),
             crash_decoder: CrashDecoder::new(),
             save_plain_text: PlainTextState::new(),
+            web_plain_text: PlainTextState::new(),
         }
+    }
+
+    fn reset_after_target_reset(&mut self) {
+        self.decoder.reset();
+        self.plain_text.reset_line();
+        self.save_plain_text.reset_line();
+        self.web_plain_text.reset_line();
+        self.crash_decoder = CrashDecoder::new();
     }
 }
 
@@ -674,6 +811,7 @@ fn handle_outcome(
     elf: Option<&ElfStrings>,
     opts: RenderOptions,
     mut save: Option<&mut SaveLog>,
+    web_log: Option<&web::LogSender>,
 ) {
     let RenderOptions {
         use_color,
@@ -695,16 +833,19 @@ fn handle_outcome(
                 if let Some(gap) = l.meta.gap {
                     let msg = format!("--- missed {gap} packet(s) before seq {} ---", l.meta.seq);
                     warn_line(&msg, use_color, timestamp);
+                    broadcast_log(web_log, format!("{}{}", timestamp_prefix(timestamp), msg));
                     if let Some(save) = save.as_deref_mut() {
                         let _ = save.write_line(&format!("{}{}", timestamp_prefix(timestamp), msg));
                     }
                 }
                 term::print_log_line(&prefix, &l.message, color_code, indent, width, use_color);
+                broadcast_log(web_log, format!("{prefix}{}", l.message));
                 if let Some(save) = save.as_deref_mut() {
                     let _ = save.write_line(&format!("{prefix}{}", l.message));
                 }
                 state.plain_text.reset_line();
                 state.save_plain_text.reset_line();
+                state.web_plain_text.reset_line();
             }
             DecodedPacket::Dropped(d) => {
                 let msg = format!(
@@ -712,11 +853,13 @@ fn handle_outcome(
                     d.count, d.meta.seq, d.meta.time_ms
                 );
                 warn_line(&msg, use_color, timestamp);
+                broadcast_log(web_log, format!("{}{}", timestamp_prefix(timestamp), msg));
                 if let Some(save) = save.as_deref_mut() {
                     let _ = save.write_line(&format!("{}{}", timestamp_prefix(timestamp), msg));
                 }
                 state.plain_text.reset_line();
                 state.save_plain_text.reset_line();
+                state.web_plain_text.reset_line();
             }
             DecodedPacket::Buffer(b) => {
                 let color_code = level_color(b.level);
@@ -741,15 +884,20 @@ fn handle_outcome(
                 } else {
                     println!("{header}");
                 }
+                broadcast_log(web_log, header.clone());
                 if let Some(save) = save.as_deref_mut() {
                     let _ = save.write_line(&header);
                 }
                 print_hexdump(&b.bytes, color_code, use_color, timestamp);
+                for line in hexdump_lines(&b.bytes, timestamp) {
+                    broadcast_log(web_log, line);
+                }
                 if let Some(save) = save.as_deref_mut() {
                     let _ = write_hexdump_to_file(save, &b.bytes, timestamp);
                 }
                 state.plain_text.reset_line();
                 state.save_plain_text.reset_line();
+                state.web_plain_text.reset_line();
             }
             DecodedPacket::Other {
                 meta,
@@ -786,8 +934,13 @@ fn handle_outcome(
             if let Some(save) = save.as_deref_mut() {
                 let _ = write_plain_text_saved(save, &bytes, timestamp, &mut state.save_plain_text);
             }
+            broadcast_plain_text(web_log, &bytes, timestamp, &mut state.web_plain_text);
             for annotation in state.crash_decoder.feed(&bytes, elf) {
                 let _ = write_plain_annotation(&mut out, &annotation, timestamp);
+                broadcast_log(
+                    web_log,
+                    format!("{}{}", timestamp_prefix(timestamp), annotation),
+                );
                 if let Some(save) = save.as_deref_mut() {
                     let _ =
                         save.write_line(&format!("{}{}", timestamp_prefix(timestamp), annotation));
@@ -858,27 +1011,7 @@ fn warn_line(msg: &str, use_color: bool, timestamp: bool) {
 /// Print a hex + ASCII dump of `bytes` to stdout, 16 bytes per line, with
 /// optional ANSI color and timestamp prefix.
 fn print_hexdump(bytes: &[u8], color_code: &str, use_color: bool, timestamp: bool) {
-    const BYTES_PER_LINE: usize = 16;
-    for (i, chunk) in bytes.chunks(BYTES_PER_LINE).enumerate() {
-        let addr = (i * BYTES_PER_LINE) as u32;
-        let hex: Vec<String> = chunk.iter().map(|b| format!("{:02x}", b)).collect();
-        let ascii: String = chunk
-            .iter()
-            .map(|&b| {
-                if (0x20..0x7f).contains(&b) {
-                    b as char
-                } else {
-                    '.'
-                }
-            })
-            .collect();
-        let line = format!(
-            "{}{:08x}  {:<48}  {}",
-            timestamp_prefix(timestamp),
-            addr,
-            hex.join(" "),
-            ascii
-        );
+    for line in hexdump_lines(bytes, timestamp) {
         if use_color {
             println!(
                 "{color}{line}{RESET}",
@@ -894,7 +1027,15 @@ fn print_hexdump(bytes: &[u8], color_code: &str, use_color: bool, timestamp: boo
 /// Write a hex + ASCII dump of `bytes` to the save file, 16 bytes per line,
 /// with optional timestamp prefix.
 fn write_hexdump_to_file(save: &mut SaveLog, bytes: &[u8], timestamp: bool) -> std::io::Result<()> {
+    for line in hexdump_lines(bytes, timestamp) {
+        save.write_line(&line)?;
+    }
+    Ok(())
+}
+
+fn hexdump_lines(bytes: &[u8], timestamp: bool) -> Vec<String> {
     const BYTES_PER_LINE: usize = 16;
+    let mut lines = Vec::new();
     for (i, chunk) in bytes.chunks(BYTES_PER_LINE).enumerate() {
         let addr = (i * BYTES_PER_LINE) as u32;
         let hex: Vec<String> = chunk.iter().map(|b| format!("{:02x}", b)).collect();
@@ -908,15 +1049,15 @@ fn write_hexdump_to_file(save: &mut SaveLog, bytes: &[u8], timestamp: bool) -> s
                 }
             })
             .collect();
-        save.write_line(&format!(
+        lines.push(format!(
             "{}{:08x}  {:<48}  {}",
             timestamp_prefix(timestamp),
             addr,
             hex.join(" "),
             ascii
-        ))?;
+        ));
     }
-    Ok(())
+    lines
 }
 
 /// Write raw plain-text bytes to the output, optionally inserting a timestamp
@@ -1016,6 +1157,42 @@ fn strip_ansi_stream(bytes: &[u8], state: &mut AnsiStripState) -> Vec<u8> {
     out
 }
 
+fn broadcast_log(web_log: Option<&web::LogSender>, line: String) {
+    if let Some(web_log) = web_log {
+        let _ = web_log.send(line);
+    }
+}
+
+fn broadcast_plain_text(
+    web_log: Option<&web::LogSender>,
+    bytes: &[u8],
+    timestamp: bool,
+    state: &mut PlainTextState,
+) {
+    let Some(web_log) = web_log else {
+        return;
+    };
+    let clean = strip_ansi_stream(bytes, &mut state.ansi);
+    if clean.is_empty() {
+        return;
+    }
+
+    let mut out = Vec::with_capacity(clean.len() + 32);
+    for &b in &clean {
+        if timestamp && state.line_start {
+            out.extend_from_slice(timestamp_prefix(true).as_bytes());
+            state.line_start = false;
+        }
+        out.push(b);
+        if b == b'\n' {
+            state.line_start = true;
+        }
+    }
+    if !out.is_empty() {
+        let _ = web_log.send(String::from_utf8_lossy(&out).into_owned());
+    }
+}
+
 /// Return the timestamp prefix string `[YYYYMMDD-HH:MM:SS.mmm] ` if `enabled`
 /// is true, otherwise an empty string.
 fn timestamp_prefix(enabled: bool) -> String {
@@ -1097,6 +1274,31 @@ mod tests {
     }
 
     #[test]
+    fn cli_accepts_web_with_default_bind_address() {
+        let cli = Cli::try_parse_from(["on9log", "--port", "/dev/ttyUSB0", "--web"]).unwrap();
+        assert_eq!(
+            cli.web,
+            Some("127.0.0.1:9090".parse::<SocketAddr>().unwrap())
+        );
+    }
+
+    #[test]
+    fn cli_accepts_web_with_explicit_bind_address() {
+        let cli = Cli::try_parse_from([
+            "on9log",
+            "--port",
+            "/dev/ttyUSB0",
+            "--web",
+            "127.0.0.1:8787",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.web,
+            Some("127.0.0.1:8787".parse::<SocketAddr>().unwrap())
+        );
+    }
+
+    #[test]
     fn cli_accepts_stdin_input() {
         let cli = Cli::try_parse_from(["on9log", "--log-stdin"]).unwrap();
         assert!(cli.log_stdin);
@@ -1108,6 +1310,7 @@ mod tests {
     fn cli_requires_exactly_one_input() {
         assert!(Cli::try_parse_from(["on9log"]).is_err());
         assert!(Cli::try_parse_from(["on9log", "--port", "/dev/ttyUSB0", "--log-stdin",]).is_err());
+        assert!(Cli::try_parse_from(["on9log", "--log-stdin", "--web"]).is_err());
     }
 
     #[test]
