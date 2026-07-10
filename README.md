@@ -17,7 +17,7 @@ This workspace contains three crates:
 | Crate | Type | Description |
 |-------|------|-------------|
 | `on9log-protocol` | library | Decoding pipeline, SLIP+CRC deframer, printf & C++23 rendering, ELF/DWARF resolution, crash backtrace annotation. No async runtime dependency — reusable from `napi-rs` or other bindings. |
-| `on9log-cli` | binary (`on9log`) | UART monitor and file/stdin stream decoder. Deframes the stream, resolves addresses against an ELF or Mach-O image, and prints colorized wrapped output with save-to-file support. |
+| `on9log-cli` | binary (`on9log`) + web UI | UART monitor and file/stdin stream decoder. Deframes the stream, resolves addresses against an ELF or Mach-O image, prints colorized wrapped output, and exposes an Axum REST/WebSocket backend plus a Bun/React web terminal under `on9log-cli/web`. |
 | `on9log-capture` | binary (`on9log-capture`) | Split customer/developer workflow. `capture` records the raw transport stream to SQLite (no ELF needed). `decode` replays a capture against an ELF to produce human-readable text. |
 
 ## Quick start
@@ -28,6 +28,12 @@ cargo build --release
 
 # Live monitor with ELF string resolution
 ./target/release/on9log -p /dev/ttyUSB0 -b 115200 --elf firmware.elf
+
+# Live monitor plus Axum HTTP/WebSocket companion server
+./target/release/on9log -p /dev/ttyUSB0 --elf firmware.elf --web
+
+# Run the web UI during development
+cd on9log-cli/web && bun run dev
 
 # Decode a stream captured from the Unix demo. Pass the matching host
 # executable: ELF on Linux, Mach-O on macOS.
@@ -46,7 +52,7 @@ cargo build --release
 ## on9log CLI
 
 ```
-on9log <--port PORT|--log-bin FILE|--log-stdin> [--elf FILE] [--no-color] [-t] [-s] [--log-path FILE]
+on9log <--port PORT|--log-bin FILE|--log-stdin> [--elf FILE] [--no-color] [-t] [-s] [--log-path FILE] [--web [ADDR]]
 ```
 
 | Flag | Description |
@@ -62,6 +68,7 @@ on9log <--port PORT|--log-bin FILE|--log-stdin> [--elf FILE] [--no-color] [-t] [
 | `--no-esp-reset` | Skip DTR/RTS reset on UART startup |
 | `-s, --save` | Save decoded text log to file |
 | `--log-path` | Output path for --save (default: `on9log-<unix_ts>.log`) |
+| `--web [ADDR]` | Start the Axum REST/WebSocket server; defaults to `127.0.0.1:9090` and increments the port if busy, UART mode only |
 
 Exactly one input option is required. `--log-bin` exits at end-of-file;
 `--log-stdin` exits when its producer closes the pipe. File and stdin input use
@@ -75,6 +82,32 @@ quit sequence. Replay is implemented in a separate blocking reader path so
 file/stdin support does not retrofit the UART loop. CLI tests cover the original
 port, baud, and `--no-esp-reset` parsing; real serial behavior still requires a
 connected device for verification.
+
+With `--web`, the UART monitor also starts an Axum companion server. By default
+it listens on `127.0.0.1:9090`; pass `--web 127.0.0.1:8787` to override the
+listen address and starting port. If the selected port is already in use, the
+server automatically tries the next port on the same address (`9091`, `9092`,
+and so on) and prints the actual bound URL on startup.
+When `--web` is active, the CLI also tries to open the actual bound URL in the
+default browser. Browser-launch errors are ignored, so headless/local-service
+environments still host the web server normally.
+
+The `on9log` binary serves the bundled web UI from the same Axum server. During
+`cargo build`, the `on9log-cli` build script embeds whatever files are currently
+present in `on9log-cli/web/dist`; rebuild the frontend first when you want the
+Rust binary to contain new UI assets. The Rust build fails if `web/dist` is
+missing, empty, or missing `index.html`.
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/ws/logs` | WebSocket | Streams decoded text log records as text messages. Binary on9log packets are sent as rendered log lines; plain-text transport is forwarded as ANSI-stripped text chunks. |
+| `/api/status` | GET | Returns JSON with `port`, `baud`, `uptime_ms`, and current websocket client count. |
+| `/api/target/reset` | POST | Performs the same ESP hard reset sequence used at startup: DTR released, RTS asserted for 100 ms, then released. Decoder sequence tracking is reset after success. |
+| `/api/serial/lines` | POST | Sets raw serial control lines. JSON body: `{"dtr":false,"rts":true}`; include either or both fields. |
+
+Serial reset/control APIs are serialized through the monitor task rather than a
+second serial handle, because `tokio-serial` does not support cloning the async
+`SerialStream`.
 
 On macOS, the binary demo writes one `@on9log-image-slide=...` metadata line
 before its framed stream. Replay consumes this line internally and applies the
@@ -155,6 +188,16 @@ locations when DWARF debug info is available.
 cargo build --release
 cargo test --workspace
 cargo clippy -- -D warnings
+
+cd on9log-cli/web
+bun run build
+bun run lint
+bun run format:check
+
+# To refresh the UI bundled in the Rust binary:
+bun run build
+cd ../..
+cargo build --release
 ```
 
 Requires Rust 1.85+ (edition 2024). Linux and macOS are supported; other

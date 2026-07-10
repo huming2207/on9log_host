@@ -169,10 +169,14 @@ host_cli/
       crash.rs               ESP panic reason/backtrace recognizer and annotator
   on9log-cli/
     Cargo.toml               CLI binary; deps: clap, tokio-serial, tokio,
-                              crossterm, libc, on9log_protocol
+                              crossterm, libc, axum, serde, on9log_protocol
+    build.rs                 embeds current web/dist frontend assets into binary
     src/
       term.rs                terminal width via `crossterm` + ANSI colors + word wrap
       main.rs                CLI binary (clap + tokio-serial)
+      web.rs                 Axum REST/WebSocket companion server for UART mode
+    web/                     Bun + Vite + React TypeScript web UI; uses MUI,
+                              react-xtermjs, ESLint, and Prettier
   on9log-capture/
     Cargo.toml               capture/replay binary; deps: clap, tokio-serial,
                               tokio, crossterm, libc, rusqlite, on9log_protocol
@@ -411,22 +415,68 @@ symbolicated. With an ELF loaded from a path, the CLI uses DWARF line info via
 `function at file:line`. Without matching debug info, addresses fall back to
 function+offset or `<unresolved>`.
 
+`web.rs` is the Axum companion server used by UART mode when `--web [ADDR]` is
+supplied. Bare `--web` starts at `127.0.0.1:9090`; `--web 127.0.0.1:8787`
+overrides the listen address and starting port. If the selected port is already
+in use, the server retries the next port on the same address (`9091`, `9092`,
+and so on) and `main.rs` prints the actual bound URL returned by `web::spawn`.
+It serves the bundled React frontend from the assets embedded by `build.rs`.
+`/ws/logs` streams decoded text log records as websocket text messages: binary
+on9log packets are rendered as normal log lines, buffer packets emit their
+header plus hexdump lines, warnings/crash annotations are included, and
+plain-text transport bytes are forwarded as ANSI-stripped text chunks. The REST
+endpoints are:
+
+- `GET /api/status` -> JSON status (`port`, `baud`, `uptime_ms`,
+  `websocket_clients`);
+- `POST /api/target/reset` -> the same ESP hard reset sequence used at startup
+  (DTR released, RTS asserted for 100 ms, then released), followed by resetting
+  the host decoder's sequence/crash/plain-text tracking;
+- `POST /api/serial/lines` with JSON `{"dtr":false,"rts":true}` -> raw DTR/RTS
+  line updates; either field may be omitted, but at least one must be present.
+
+`tokio-serial` does not support cloning the async `SerialStream`, so web control
+requests are sent over a bounded channel to the monitor task and applied against
+the same live serial handle that reads the UART. Do not add a second serial open
+for these APIs unless the ownership model is deliberately changed.
+
+`on9log-cli/web` is the bundled frontend project. It is a Bun project using
+Vite, React, TypeScript, `react-xtermjs`/Xterm.js for the log terminal, and
+MUI/Emotion for the theme. During development, Vite proxies `/api/*` and `/ws/*`
+to `http://127.0.0.1:9090`; set
+`VITE_ON9LOG_BACKEND_URL=http://127.0.0.1:<port>` when the backend selected a
+different auto-incremented port. The production build uses same-origin API and
+websocket URLs so it can be served by the Axum backend. The `on9log-cli` build
+script embeds whatever files exist in `on9log-cli/web/dist` at `cargo build`
+time; it does not run Bun itself. The build script fails the Rust build when
+`web/dist` is missing, empty, or missing `index.html`. Run `bun run build`
+before `cargo build` when the bundled UI should include frontend changes. Use
+`bun run build`, `bun run lint`, and `bun run format:check` before handing off
+frontend changes.
+
+When `--web` is active, `main.rs` calls the platform browser opener (`open` on
+macOS, `cmd /C start` on Windows, `xdg-open` elsewhere) after Axum has bound the
+actual URL. This is best-effort only: launch failures are deliberately ignored,
+and hosting must continue normally in headless environments.
+
 `main.rs` is the CLI. It uses clap with derive and requires exactly one input:
 `-p/--port`, `--log-bin <FILE>`, or `--log-stdin`. UART mode also accepts
 `-b/--baud` (default 115200). Shared options are `--elf` (optional firmware ELF
 path), `--no-color`, `-t/--timestamp`, `--width` (0 = auto-detect),
-`-s/--save`, and `--log-path`. It loads the ELF up front. UART mode builds a
-tokio runtime, opens the serial port via
+`-s/--save`, and `--log-path`. UART-only `--web [ADDR]` starts the Axum
+REST/WebSocket server described above. It loads the ELF up front. UART mode
+builds a tokio runtime, opens the serial port via
 `tokio_serial::new(port, baud).open_native_async()`, and by default performs an
 ESP hard reset by releasing DTR/GPIO0, asserting RTS/EN for 100 ms, then
 releasing RTS/EN and waiting another 100 ms. `--no-esp-reset` disables this
 startup reset. File and stdin modes use blocking 4096-byte reads and feed the
 same deframer/rendering pipeline; they exit at EOF and never reset an ESP target
 or take over stdin for monitor keys. The UART read loop also uses 4096-byte
-chunks. When stdin is a TTY, the CLI also puts stdin into non-canonical,
-no-echo input mode and exits on the two-key monitor sequence `Ctrl+]` followed
-by `Ctrl+T`. On Unix this preserves output processing, so normal `\n` log output
-continues to render correctly.
+chunks and, when web mode is enabled, selects over serial reads, monitor keys,
+and web control requests. When stdin is a TTY, the CLI also puts stdin into
+non-canonical, no-echo input mode and exits on the two-key monitor sequence
+`Ctrl+]` followed by `Ctrl+T`. On Unix this preserves output processing, so
+normal `\n` log output continues to render correctly.
 
 Verified plain-text transport frames and printable raw UART text are written to
 stdout byte-for-byte unless `--timestamp` is set, in which case a local
@@ -722,6 +772,12 @@ decoding.
 
 ```bash
 cd on9log_host
+
+# required before cargo builds `on9log_cli`; build.rs embeds web/dist
+cd on9log-cli/web
+bun run build
+cd ../..
+
 cargo build --release
 
 # original UART monitor path
@@ -754,6 +810,8 @@ CLI flags:
     --no-esp-reset    do not toggle DTR/RTS to reset on startup
 -s, --save            save decoded human-readable text log to file
     --log-path <FILE> path for --save output; default on9log-UNIX_TIMESTAMP.log
+    --web [<ADDR>]    start Axum REST/WebSocket server; default 127.0.0.1:9090,
+                      auto-increments the port when busy
 ```
 
 Exactly one of `--port`, `--log-bin`, or `--log-stdin` is required. The UART
@@ -767,10 +825,20 @@ behavior still requires hardware testing.
 Tests:
 
 ```bash
+cd on9log-cli/web
+bun run build
+bun run lint
+bun run format:check
+cd ../..
+
 cargo test --workspace
                  # CRC, sprintf rendering, framing/raw text, crash decode,
                  # ELF resolution, terminal wrapping, and CLI helpers
 cargo clippy --workspace --lib --bins -- -D warnings
+
+# refresh the web UI embedded in the Rust binary
+cd on9log-cli/web && bun run build && cd ../..
+cargo build --release
 ```
 
 ## Future Work
