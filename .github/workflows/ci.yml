@@ -30,6 +30,20 @@ jobs:
         with:
           components: clippy
 
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install web dependencies
+        working-directory: on9log-cli/web
+        run: bun install --frozen-lockfile
+
+      - name: Check and build web UI
+        working-directory: on9log-cli/web
+        run: |
+          bun run lint
+          bun run format:check
+          bun run build
+
       - name: Cache Cargo
         uses: actions/cache@v4
         with:

@@ -5,6 +5,7 @@
 # Rust edition 2024 requires rustc 1.85+.
 
 stages:
+  - frontend
   - build
   - test
 
@@ -19,12 +20,33 @@ variables:
   CARGO_INCREMENTAL: 0
 
 # ---------------------------------------------------------------------------
-# Build
+# Frontend bundle
+# ---------------------------------------------------------------------------
+web-build:
+  stage: frontend
+  extends: .default-settings
+  image: oven/bun:1
+  script:
+    - cd on9log-cli/web
+    - bun install --frozen-lockfile
+    - bun run lint
+    - bun run format:check
+    - bun run build
+  artifacts:
+    paths:
+      - on9log-cli/web/dist/
+    expire_in: 1 day
+
+# ---------------------------------------------------------------------------
+# Rust build
 # ---------------------------------------------------------------------------
 build:
   stage: build
   extends: .default-settings
   image: rust:bullseye
+  needs:
+    - job: web-build
+      artifacts: true
   before_script:
     - rustup component add clippy
   script:
@@ -43,7 +65,10 @@ test:
   extends: .default-settings
   image: rust:bullseye
   needs:
-    - build
+    - job: web-build
+      artifacts: true
+    - job: build
+      artifacts: true
   before_script:
     - rustup component add clippy
   script:
