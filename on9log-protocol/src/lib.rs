@@ -31,6 +31,13 @@ pub mod framer;
 pub mod printf;
 pub mod wire;
 
+/// Maximum width or precision accepted by the host renderers.
+///
+/// Dynamic counts come from device-controlled wire arguments. Bounding them
+/// prevents malformed logs from requesting effectively unbounded padding or
+/// precision allocations in either formatting backend.
+pub(crate) const MAX_RENDER_COUNT: usize = 4096;
+
 /// Re-export [`CrashDecoder`] — a streaming panic-text annotator for ESP-IDF crashes.
 pub use crash::CrashDecoder;
 /// Re-export core decode API: [`Decoder`], [`DecodedPacket`], and record types.

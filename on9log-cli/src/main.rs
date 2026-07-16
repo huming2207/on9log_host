@@ -242,63 +242,128 @@ struct ReplayConfig {
 }
 
 const IMAGE_SLIDE_PREFIX: &[u8] = b"@on9log-image-slide=";
+const IMAGE_SLIDE_METADATA_MAX: usize = 128;
 
-/// Startup-only parser for the macOS host demo's image-slide metadata line.
-/// Non-matching input is passed through unchanged to the normal deframer.
-struct ReplayPreamble {
-    pending: Vec<u8>,
-    decided: bool,
-}
-
-enum ReplayPreambleResult {
-    Pending,
+/// One item emitted by [`ReplayMetadataFilter`].
+enum ReplayInput {
+    /// Ordinary stream bytes to pass to the transport deframer unchanged.
     Data(Vec<u8>),
-    ImageSlide(u32, Vec<u8>),
+    /// A macOS demo image slide parsed from an out-of-frame metadata line.
+    ImageSlide(u32),
 }
 
-impl ReplayPreamble {
+/// Streaming filter for macOS demo image-slide metadata.
+///
+/// Metadata may appear again when a demo process restarts in a long-lived
+/// `--log-stdin` pipeline. The filter therefore recognizes the reserved line
+/// at stream start, after a newline, or immediately after a completed frame,
+/// while passing all other bytes to the deframer unchanged.
+struct ReplayMetadataFilter {
+    candidate: Vec<u8>,
+    in_frame: bool,
+    escape: bool,
+    at_text_boundary: bool,
+}
+
+impl ReplayMetadataFilter {
     fn new() -> Self {
         Self {
-            pending: Vec::new(),
-            decided: false,
+            candidate: Vec::new(),
+            in_frame: false,
+            escape: false,
+            at_text_boundary: true,
         }
     }
 
-    fn feed(&mut self, bytes: &[u8]) -> ReplayPreambleResult {
-        self.pending.extend_from_slice(bytes);
+    fn feed(&mut self, bytes: &[u8]) -> Vec<ReplayInput> {
+        let mut items = Vec::new();
+        let mut data = Vec::with_capacity(bytes.len());
 
-        if self.pending.len() <= IMAGE_SLIDE_PREFIX.len()
-            && IMAGE_SLIDE_PREFIX.starts_with(&self.pending)
-        {
-            return ReplayPreambleResult::Pending;
-        }
-
-        if self.pending.starts_with(IMAGE_SLIDE_PREFIX) {
-            if let Some(newline) = self.pending.iter().position(|&b| b == b'\n') {
-                let value = &self.pending[IMAGE_SLIDE_PREFIX.len()..newline];
-                if let Ok(value) = std::str::from_utf8(value)
-                    && let Ok(slide) = u32::from_str_radix(value, 16)
-                {
-                    let remaining = self.pending.split_off(newline + 1);
-                    self.pending.clear();
-                    self.decided = true;
-                    return ReplayPreambleResult::ImageSlide(slide, remaining);
+        for &byte in bytes {
+            if self.in_frame {
+                data.push(byte);
+                if self.escape {
+                    self.escape = false;
+                    if !matches!(byte, 0xdc | 0xdd | 0xde | 0xd0 | 0xd1) {
+                        self.in_frame = false;
+                        self.at_text_boundary = true;
+                    }
+                } else {
+                    match byte {
+                        0xdb => self.escape = true,
+                        0xc0 => {
+                            self.in_frame = false;
+                            self.at_text_boundary = true;
+                        }
+                        _ => {}
+                    }
                 }
-            } else if self.pending.len() < 128 {
-                return ReplayPreambleResult::Pending;
+                continue;
+            }
+
+            if !self.candidate.is_empty()
+                || (self.at_text_boundary && byte == IMAGE_SLIDE_PREFIX[0])
+            {
+                if self.candidate.len() < IMAGE_SLIDE_PREFIX.len() {
+                    let expected = IMAGE_SLIDE_PREFIX[self.candidate.len()];
+                    if byte == expected {
+                        self.candidate.push(byte);
+                        continue;
+                    }
+
+                    data.append(&mut self.candidate);
+                    data.push(byte);
+                    self.at_text_boundary = byte == b'\n';
+                    continue;
+                }
+
+                self.candidate.push(byte);
+                if byte == b'\n' {
+                    let value = self.candidate[IMAGE_SLIDE_PREFIX.len()..]
+                        .strip_suffix(b"\n")
+                        .and_then(|v| v.strip_suffix(b"\r").or(Some(v)));
+                    let slide = value
+                        .filter(|v| v.len() == 8)
+                        .and_then(|v| std::str::from_utf8(v).ok())
+                        .and_then(|v| u32::from_str_radix(v, 16).ok());
+                    if let Some(slide) = slide {
+                        if !data.is_empty() {
+                            items.push(ReplayInput::Data(std::mem::take(&mut data)));
+                        }
+                        items.push(ReplayInput::ImageSlide(slide));
+                        self.candidate.clear();
+                    } else {
+                        data.append(&mut self.candidate);
+                    }
+                    self.at_text_boundary = true;
+                } else if self.candidate.len() >= IMAGE_SLIDE_METADATA_MAX {
+                    data.append(&mut self.candidate);
+                    self.at_text_boundary = false;
+                }
+                continue;
+            }
+
+            data.push(byte);
+            if byte == 0xa5 {
+                self.in_frame = true;
+                self.escape = false;
+                self.at_text_boundary = false;
+            } else {
+                self.at_text_boundary = byte == b'\n';
             }
         }
 
-        self.decided = true;
-        ReplayPreambleResult::Data(std::mem::take(&mut self.pending))
+        if !data.is_empty() {
+            items.push(ReplayInput::Data(data));
+        }
+        items
     }
 
     fn finish(&mut self) -> Option<Vec<u8>> {
-        if self.pending.is_empty() {
+        if self.candidate.is_empty() {
             None
         } else {
-            self.decided = true;
-            Some(std::mem::take(&mut self.pending))
+            Some(std::mem::take(&mut self.candidate))
         }
     }
 }
@@ -435,7 +500,7 @@ fn run_reader<R: std::io::Read>(
     let mut deframer = Deframer::new();
     let mut state = DecodeState::new();
     let mut buf = [0u8; 4096];
-    let mut preamble = ReplayPreamble::new();
+    let mut metadata = ReplayMetadataFilter::new();
     let opts = RenderOptions {
         use_color: cfg.use_color,
         width: cfg.width,
@@ -452,36 +517,9 @@ fn run_reader<R: std::io::Read>(
         if n == 0 {
             break;
         }
-        if preamble.decided {
-            process_input_bytes(
-                &buf[..n],
-                &mut deframer,
-                &mut state,
-                cfg.elf.as_deref(),
-                opts,
-                cfg.save.as_mut(),
-                None,
-            );
-            continue;
-        }
-
-        match preamble.feed(&buf[..n]) {
-            ReplayPreambleResult::Pending => {}
-            ReplayPreambleResult::Data(data) => process_input_bytes(
-                &data,
-                &mut deframer,
-                &mut state,
-                cfg.elf.as_deref(),
-                opts,
-                cfg.save.as_mut(),
-                None,
-            ),
-            ReplayPreambleResult::ImageSlide(slide, data) => {
-                if let Some(elf) = cfg.elf.as_deref() {
-                    elf.set_address_slide(slide);
-                    eprintln!("on9log: applied host image slide 0x{slide:08x}");
-                }
-                process_input_bytes(
+        for item in metadata.feed(&buf[..n]) {
+            match item {
+                ReplayInput::Data(data) => process_input_bytes(
                     &data,
                     &mut deframer,
                     &mut state,
@@ -489,12 +527,19 @@ fn run_reader<R: std::io::Read>(
                     opts,
                     cfg.save.as_mut(),
                     None,
-                );
+                ),
+                ReplayInput::ImageSlide(slide) => {
+                    state.reset_after_target_reset();
+                    if let Some(elf) = cfg.elf.as_deref() {
+                        elf.set_address_slide(slide);
+                        eprintln!("on9log: applied host image slide 0x{slide:08x}");
+                    }
+                }
             }
         }
     }
 
-    if let Some(data) = preamble.finish() {
+    if let Some(data) = metadata.finish() {
         process_input_bytes(
             &data,
             &mut deframer,
@@ -531,6 +576,9 @@ struct SaveLog {
     path: PathBuf,
     /// Open writable file handle.
     file: std::fs::File,
+    /// Set after the first write/flush/sync failure so subsequent writes are
+    /// skipped after one actionable warning.
+    disabled: bool,
 }
 
 impl SaveLog {
@@ -539,22 +587,48 @@ impl SaveLog {
     fn create(path: Option<PathBuf>) -> std::io::Result<Self> {
         let path = path.unwrap_or_else(default_save_path);
         let file = std::fs::File::create(&path)?;
-        Ok(Self { path, file })
+        Ok(Self {
+            path,
+            file,
+            disabled: false,
+        })
+    }
+
+    fn write_immediate(
+        &mut self,
+        op: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        if self.disabled {
+            return Ok(());
+        }
+        let result = op(&mut self.file);
+        if let Err(error) = &result {
+            eprintln!(
+                "on9log: save-file error for {}: {error}; disabling save output",
+                self.path.display()
+            );
+            self.disabled = true;
+        }
+        result
     }
 
     /// Write all `bytes` to the file, flush, and `sync_data()` for durability.
     fn write_all_immediate(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        self.file.write_all(bytes)?;
-        self.file.flush()?;
-        self.file.sync_data()
+        self.write_immediate(|file| {
+            file.write_all(bytes)?;
+            file.flush()?;
+            file.sync_data()
+        })
     }
 
     /// Write a single `line` (with trailing newline), flush, and `sync_data()`.
     fn write_line(&mut self, line: &str) -> std::io::Result<()> {
-        self.file.write_all(line.as_bytes())?;
-        self.file.write_all(b"\n")?;
-        self.file.flush()?;
-        self.file.sync_data()
+        self.write_immediate(|file| {
+            file.write_all(line.as_bytes())?;
+            file.write_all(b"\n")?;
+            file.flush()?;
+            file.sync_data()
+        })
     }
 }
 
@@ -1314,28 +1388,31 @@ mod tests {
     }
 
     #[test]
-    fn replay_preamble_parses_split_image_slide() {
-        let mut preamble = ReplayPreamble::new();
-        assert!(matches!(
-            preamble.feed(b"@on9log-image-"),
-            ReplayPreambleResult::Pending
-        ));
-        match preamble.feed(b"slide=0123abcd\n\xa5rest") {
-            ReplayPreambleResult::ImageSlide(slide, data) => {
-                assert_eq!(slide, 0x0123_abcd);
-                assert_eq!(data, b"\xa5rest");
-            }
-            _ => panic!("expected image-slide metadata"),
-        }
+    fn replay_metadata_parses_split_image_slide() {
+        let mut metadata = ReplayMetadataFilter::new();
+        assert!(metadata.feed(b"@on9log-image-").is_empty());
+        let items = metadata.feed(b"slide=0123abcd\n\xa5rest");
+        assert!(matches!(items[0], ReplayInput::ImageSlide(0x0123_abcd)));
+        assert!(matches!(&items[1], ReplayInput::Data(data) if data == b"\xa5rest"));
     }
 
     #[test]
-    fn replay_preamble_preserves_normal_binary_input() {
-        let mut preamble = ReplayPreamble::new();
-        match preamble.feed(b"\xa5\x01binary") {
-            ReplayPreambleResult::Data(data) => assert_eq!(data, b"\xa5\x01binary"),
-            _ => panic!("expected normal input passthrough"),
-        }
+    fn replay_metadata_updates_after_restart() {
+        let mut metadata = ReplayMetadataFilter::new();
+        let items = metadata.feed(
+            b"@on9log-image-slide=00000001\n\xa5\x01\x00\x00\xc0@on9log-image-slide=00000002\n\xa5next",
+        );
+        assert!(matches!(items[0], ReplayInput::ImageSlide(1)));
+        assert!(matches!(&items[1], ReplayInput::Data(data) if data == b"\xa5\x01\x00\x00\xc0"));
+        assert!(matches!(items[2], ReplayInput::ImageSlide(2)));
+        assert!(matches!(&items[3], ReplayInput::Data(data) if data == b"\xa5next"));
+    }
+
+    #[test]
+    fn replay_metadata_preserves_normal_binary_input() {
+        let mut metadata = ReplayMetadataFilter::new();
+        let items = metadata.feed(b"\xa5\x01binary");
+        assert!(matches!(&items[0], ReplayInput::Data(data) if data == b"\xa5\x01binary"));
     }
 
     #[test]

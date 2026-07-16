@@ -91,15 +91,17 @@ impl CaptureDb {
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        if !has_events_table(&conn)? {
+        )
+        .map_err(|error| readonly_open_error(path, error))?;
+        if !has_events_table(&conn).map_err(|error| readonly_open_error(path, error))? {
             return Err(format!(
                 "not an on9log-capture database (no `events` table): {}",
                 path.display()
             )
             .into());
         }
-        conn.pragma_update(None, "query_only", true)?;
+        conn.pragma_update(None, "query_only", true)
+            .map_err(|error| readonly_open_error(path, error))?;
         Ok(Self { conn })
     }
 
@@ -171,6 +173,15 @@ impl CaptureDb {
         }
         Ok(())
     }
+}
+
+/// Add recovery guidance for captures whose live WAL sidecars were not copied.
+fn readonly_open_error(path: &Path, error: impl std::fmt::Display) -> Box<dyn std::error::Error> {
+    format!(
+        "opening capture database {} read-only: {error}. If capture ended unexpectedly, keep and copy the matching `-wal` and `-shm` files beside the `.sqlite` file, or checkpoint the database before transferring it",
+        path.display()
+    )
+    .into()
 }
 
 /// Insert a single [`Outcome`] into the `events` table using the prepared

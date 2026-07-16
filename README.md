@@ -109,10 +109,11 @@ Serial reset/control APIs are serialized through the monitor task rather than a
 second serial handle, because `tokio-serial` does not support cloning the async
 `SerialStream`.
 
-On macOS, the binary demo writes one `@on9log-image-slide=...` metadata line
-before its framed stream. Replay consumes this line internally and applies the
-ASLR slide while resolving 32-bit format/tag IDs against the matching Mach-O
-executable; the metadata line is not printed as device output. Linux builds the
+On macOS, each binary demo process writes an `@on9log-image-slide=...` metadata
+line before its framed stream. Replay consumes these lines internally,
+including after a demo restart in one long-lived stdin pipe, and applies the
+current ASLR slide while resolving 32-bit format/tag IDs against the matching
+Mach-O executable; metadata is not printed as device output. Linux builds the
 binary demo as non-PIE so its IDs resolve directly against the matching ELF.
 
 Output uses standard ESP-IDF log formatting:

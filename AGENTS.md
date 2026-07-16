@@ -275,12 +275,13 @@ strings, lookup fails instead of silently choosing one. When no ELF is supplied,
 or lookup fails, addresses render as `@0x........` / `<fmt @0x........>`.
 
 For Unix host demos, the same resolver also accepts a thin Mach-O executable.
-macOS requires PIE, so `on9log_unix_stdio.c` emits a leading
+macOS requires PIE, so `on9log_unix_stdio.c` emits an
 `@on9log-image-slide=XXXXXXXX` metadata line in binary mode. File/stdin replay
-consumes that line before deframing and normalizes captured 32-bit pointer IDs
-against the unslid Mach-O section addresses. Linux links only the binary demo
-without PIE, so no slide metadata is needed there. UART mode does not inspect
-or alter this replay-only preamble.
+recognizes this reserved out-of-frame line at startup and after later demo
+restarts, resets decode/crash tracking, and normalizes subsequent 32-bit pointer
+IDs against the unslid Mach-O section addresses. Linux links only the binary
+demo without PIE, so no slide metadata is needed there. UART mode does not
+inspect or alter this replay-only metadata.
 
 `printf.rs` renders a format string against decoded `Arg` values using the
 `sprintf` crate (`sprintf::vsprintf`), which performs all digit conversion,
@@ -318,6 +319,13 @@ strings and each is decoded by the appropriate renderer. Note: a bare `%`
 followed by a conversion-looking sequence (e.g. `% d`, which is a valid printf
 space-flag conversion) wins the printf path; C++-style authors must not leave an
 unescaped `%` immediately before a conversion letter.
+
+Both renderers bound device-controlled dynamic width and precision to 4096.
+The printf path clamps resolved `*` values before handing the rewritten format
+to `sprintf`; the C++ path rejects an out-of-range nested count with a visible
+`<render error: ...>` marker. This prevents a malformed device packet from
+requesting unbounded padding/precision allocation or overflowing `sprintf`'s
+internal numeric parser.
 
 `cppfmt.rs` renders C++23 `std::format`-style format strings (`{}`, `{:d}`,
 `{0:>10.2f}`, ...) against the same decoded `Arg` values, using Rust's
@@ -493,7 +501,9 @@ epoch. Binary on9log packets are saved after host decoding, not as raw binary
 frames. Plain-text device output is saved with ANSI escape sequences stripped so
 the file stays readable. If `-t/--timestamp` is enabled, the same local timestamp
 prefix is included in the saved file. File writes are flushed and `sync_data()`ed
-after each decoded/logged item so the file is updated immediately.
+after each decoded/logged item so the file is updated immediately. A
+write/flush/sync failure produces one stderr warning and disables that save
+sink rather than silently continuing with a truncated artifact.
 
 ## on9log-capture: capture to SQLite and replay against an ELF
 
@@ -517,7 +527,8 @@ after each decoded/logged item so the file is updated immediately.
   `--save`, it prints human-readable text to stdout. With `--save`, rendered
   text is written only to the requested file. `--no-color` disables generated
   colors and strips ANSI escape sequences from captured plain text before
-  writing the selected output sink.
+  writing the selected output sink. Save-file output strips captured ANSI
+  unconditionally, matching the live CLI even without `--no-color`.
 
 Storage is deliberately **ELF-independent**. The capture database holds the raw
 18-byte on9log header and payload BLOBs (for frames), the raw text bytes (for
@@ -547,7 +558,10 @@ events(
 each UART read's outcomes in one transaction. Appending to an existing capture
 file is supported (AUTOINCREMENT continues). `decode` opens with SQLite
 read-only flags plus the `query_only` pragma and errors if the path is missing
-or lacks the `events` table, so it can never mutate a customer's capture.
+or lacks the `events` table, so it can never mutate a customer's capture. If
+read-only opening fails after an interrupted capture, the error explicitly
+reminds the user to transfer the matching `-wal` and `-shm` sidecars or
+checkpoint the database first.
 
 `decode` uses one stateful `Renderer` (in `main.rs`) that wraps `Decoder` +
 `CrashDecoder` and renders an `Outcome` exactly as the live CLI does. The

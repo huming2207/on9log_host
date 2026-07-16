@@ -244,7 +244,7 @@ fn decode_run(args: DecodeArgs) -> Result<(), Box<dyn std::error::Error>> {
             width,
             timestamp: args.timestamp,
             to_stdout,
-            strip_ansi: args.no_color,
+            strip_ansi: args.no_color || !to_stdout,
         },
         save,
     );
@@ -532,6 +532,9 @@ struct SaveLog {
     path: PathBuf,
     /// Open writable file handle.
     file: std::fs::File,
+    /// Set after the first write/flush/sync failure so subsequent writes are
+    /// skipped after one actionable warning.
+    disabled: bool,
 }
 
 impl SaveLog {
@@ -542,22 +545,45 @@ impl SaveLog {
         Ok(Self {
             path: path.to_path_buf(),
             file,
+            disabled: false,
         })
+    }
+
+    fn write_immediate(
+        &mut self,
+        op: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        if self.disabled {
+            return Ok(());
+        }
+        let result = op(&mut self.file);
+        if let Err(error) = &result {
+            eprintln!(
+                "on9log-capture: save-file error for {}: {error}; disabling save output",
+                self.path.display()
+            );
+            self.disabled = true;
+        }
+        result
     }
 
     /// Write all `bytes` to the file, flush, and `sync_data()` for durability.
     fn write_all_immediate(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        self.file.write_all(bytes)?;
-        self.file.flush()?;
-        self.file.sync_data()
+        self.write_immediate(|file| {
+            file.write_all(bytes)?;
+            file.flush()?;
+            file.sync_data()
+        })
     }
 
     /// Write a single `line` (with trailing newline), flush, and `sync_data()`.
     fn write_line(&mut self, line: &str) -> std::io::Result<()> {
-        self.file.write_all(line.as_bytes())?;
-        self.file.write_all(b"\n")?;
-        self.file.flush()?;
-        self.file.sync_data()
+        self.write_immediate(|file| {
+            file.write_all(line.as_bytes())?;
+            file.write_all(b"\n")?;
+            file.flush()?;
+            file.sync_data()
+        })
     }
 }
 

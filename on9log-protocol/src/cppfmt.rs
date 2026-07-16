@@ -59,7 +59,7 @@
 //! - Rust's `LowerExp`/`UpperExp` use a 1-digit exponent (`e0`) versus C++'s
 //!   `e+00`.
 
-use crate::printf::Arg;
+use crate::{MAX_RENDER_COUNT, printf::Arg};
 
 /// A parsed piece of a format string: either literal text or a replacement field.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -277,7 +277,8 @@ pub fn render(fmt: &str, args: &[Arg]) -> String {
     out
 }
 
-/// Resolve a dynamic width/precision argument to a non-negative `usize`.
+/// Resolve a dynamic width/precision argument to a bounded, non-negative
+/// `usize`.
 ///
 /// C++23 treats a negative dynamic width/precision as a format error, so a
 /// 32-bit value whose signed interpretation is negative is rejected (this also
@@ -294,6 +295,11 @@ fn fetch_count(args: &[Arg], idx: usize) -> Result<usize, String> {
     };
     if signed < 0 {
         return Err("negative dynamic width/precision".into());
+    }
+    if signed as u64 > MAX_RENDER_COUNT as u64 {
+        return Err(format!(
+            "dynamic width/precision exceeds {MAX_RENDER_COUNT}"
+        ));
     }
     Ok(signed as usize)
 }
@@ -990,6 +996,18 @@ mod tests {
     fn dynamic_count_negative_is_error() {
         let r = render("[{:{}}]", &[Arg::U32(1), Arg::U32(0xffff_ffff)]);
         assert!(r.starts_with("<render error"), "got {r}");
+    }
+
+    #[test]
+    fn dynamic_count_above_limit_is_error() {
+        let r = render(
+            "[{:{}}]",
+            &[Arg::U32(1), Arg::U32(MAX_RENDER_COUNT as u32 + 1)],
+        );
+        assert!(r.contains("exceeds 4096"), "got {r}");
+
+        let r = render("[{:.{}d}]", &[Arg::U32(1), Arg::U64(i64::MAX as u64)]);
+        assert!(r.contains("exceeds 4096"), "got {r}");
     }
 
     #[test]

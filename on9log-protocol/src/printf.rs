@@ -22,6 +22,8 @@
 
 use sprintf::{Printf, vsprintf};
 
+use crate::MAX_RENDER_COUNT;
+
 /// Dispatch `fmt` to the right renderer.
 ///
 /// A format string is routed to the C++23 ([`crate::cppfmt`]) renderer only if
@@ -288,14 +290,15 @@ fn next_int(args: &[Arg], ai: &mut usize) -> i64 {
 /// Emit a resolved `*` width into the format. C semantics: a negative width
 /// means left-justify with width `abs(v)`; zero means no padding.
 fn push_width_literal(out: &mut String, v: i64, has_minus_flag: &mut bool) {
+    let width = v.unsigned_abs().min(MAX_RENDER_COUNT as u64);
     if v < 0 {
         if !*has_minus_flag {
             out.push('-');
             *has_minus_flag = true;
         }
-        out.push_str(&(v.unsigned_abs()).to_string());
+        out.push_str(&width.to_string());
     } else if v > 0 {
-        out.push_str(&v.to_string());
+        out.push_str(&width.to_string());
     }
     // v == 0 → emit nothing (no padding).
 }
@@ -305,7 +308,7 @@ fn push_width_literal(out: &mut String, v: i64, has_minus_flag: &mut bool) {
 fn push_precision_literal(out: &mut String, v: i64) {
     if v >= 0 {
         out.push('.');
-        out.push_str(&v.to_string());
+        out.push_str(&(v as u64).min(MAX_RENDER_COUNT as u64).to_string());
     }
     // v < 0 → omit the precision entirely.
 }
@@ -557,6 +560,25 @@ mod tests {
             &[Arg::U32((-5i32) as u32), Arg::Str(Some(b"x".to_vec()))],
         );
         assert_eq!(s, "[x    ]");
+    }
+
+    #[test]
+    fn dynamic_width_is_bounded() {
+        let s = render("[%*d]", &[Arg::U32(0x8000_0000), Arg::U32(7)]);
+        assert_eq!(s.len(), MAX_RENDER_COUNT + 2);
+        assert!(s.starts_with("[7"));
+        assert!(s.ends_with(']'));
+    }
+
+    #[test]
+    fn dynamic_precision_is_bounded() {
+        let s = render(
+            "[%.*f]",
+            &[Arg::U64(i64::MAX as u64), Arg::U64(1.0f64.to_bits())],
+        );
+        assert_eq!(s.len(), MAX_RENDER_COUNT + 4);
+        assert!(s.starts_with("[1."));
+        assert!(s.ends_with(']'));
     }
 
     #[test]
