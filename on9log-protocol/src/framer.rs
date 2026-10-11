@@ -62,6 +62,10 @@ pub struct Deframer {
     in_frame: bool,
     /// `true` when the previous byte was a SLIP escape (`SLIP_ESC`).
     escape: bool,
+    /// `true` after an error inside a frame: the rest of that frame is skipped
+    /// until its end or the next start marker, so its binary bytes are never
+    /// surfaced as plain text.
+    discarding: bool,
 }
 
 impl Default for Deframer {
@@ -78,6 +82,7 @@ impl Deframer {
             raw_text: Vec::with_capacity(256),
             in_frame: false,
             escape: false,
+            discarding: false,
         }
     }
 
@@ -101,7 +106,17 @@ impl Deframer {
                 continue;
             }
 
+            if self.discarding {
+                match b {
+                    SLIP_START => self.start_frame(),
+                    SLIP_END => self.end_frame(),
+                    _ => {}
+                }
+                continue;
+            }
+
             if self.escape {
+                self.escape = false;
                 let unescaped = match b {
                     SLIP_ESC_END => Some(SLIP_END),
                     SLIP_ESC_ESC => Some(SLIP_ESC),
@@ -110,14 +125,18 @@ impl Deframer {
                     SLIP_ESC_LF => Some(b'\n'),
                     _ => None,
                 };
-                if let Some(v) = unescaped {
-                    self.push_byte(v, &mut out);
-                } else {
-                    self.buf.clear();
-                    self.in_frame = false;
-                    out.push(Outcome::InvalidEscape);
+                match unescaped {
+                    Some(v) => self.push_byte(v, &mut out),
+                    None => {
+                        out.push(Outcome::InvalidEscape);
+                        // A raw marker after the escape still delimits frames.
+                        match b {
+                            SLIP_START => self.start_frame(),
+                            SLIP_END => self.end_frame(),
+                            _ => self.discarding = true,
+                        }
+                    }
                 }
-                self.escape = false;
                 continue;
             }
 
@@ -152,12 +171,28 @@ impl Deframer {
         let max_frame_bytes = 1 + TRANSPORT_MAX_PAYLOAD + 2;
         if self.buf.len() >= max_frame_bytes {
             self.buf.clear();
-            self.in_frame = false;
             self.escape = false;
+            self.discarding = true;
             out.push(Outcome::FrameTooLong);
             return;
         }
         self.buf.push(byte);
+    }
+
+    /// Begin a fresh frame after a start marker.
+    fn start_frame(&mut self) {
+        self.buf.clear();
+        self.in_frame = true;
+        self.escape = false;
+        self.discarding = false;
+    }
+
+    /// Leave frame mode after an end marker.
+    fn end_frame(&mut self) {
+        self.buf.clear();
+        self.in_frame = false;
+        self.escape = false;
+        self.discarding = false;
     }
 
     /// Flush any accumulated raw text bytes as an [`Outcome::PlainText`].
@@ -221,6 +256,44 @@ impl Deframer {
             payload: inner_payload.to_vec(),
         }))
     }
+}
+
+/// Split a buffer of back-to-back on9log packets with no transport framing,
+/// such as one MQTT or WebSocket message from a batching transport.
+///
+/// Each packet's exact `payload_len` marks where the next one starts. Without
+/// framing there is no way to resynchronise, so parsing stops at the first
+/// problem: a header that does not parse ([`Outcome::BadMagic`]), a packet cut
+/// short ([`Outcome::Truncated`]), or a pre-v1 packet whose length is unknown
+/// ([`Outcome::LengthMismatch`]).
+pub fn split_packets(mut bytes: &[u8]) -> Vec<Outcome> {
+    let mut out = Vec::new();
+    while !bytes.is_empty() {
+        if bytes.len() < HEADER_LEN {
+            out.push(Outcome::Truncated);
+            break;
+        }
+        let Some(header) = Header::parse(&bytes[..HEADER_LEN]) else {
+            out.push(Outcome::BadMagic);
+            break;
+        };
+        if header.payload_len == PAYLOAD_LEN_STREAMING {
+            out.push(Outcome::LengthMismatch);
+            break;
+        }
+        let total = HEADER_LEN + usize::from(header.payload_len);
+        if bytes.len() < total {
+            out.push(Outcome::Truncated);
+            break;
+        }
+        out.push(Outcome::Frame(RawFrame {
+            header,
+            header_bytes: bytes[..HEADER_LEN].to_vec(),
+            payload: bytes[HEADER_LEN..total].to_vec(),
+        }));
+        bytes = &bytes[total..];
+    }
+    out
 }
 
 #[cfg(test)]
@@ -485,6 +558,75 @@ mod tests {
         let mut d = Deframer::new();
         let outcomes = d.feed(&wire);
         assert!(matches!(outcomes[0], Outcome::FrameTooLong));
+    }
+
+    /// A packet with an exact payload length, for the unframed splitter.
+    fn packet(ptype: PacketType, seq: u16, payload: &[u8]) -> Vec<u8> {
+        let mut p = vec![PACKET_MAGIC, (ptype as u8) << 4];
+        p.extend_from_slice(&seq.to_le_bytes());
+        p.extend_from_slice(&[0; 12]);
+        p.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+        p.extend_from_slice(payload);
+        p
+    }
+
+    #[test]
+    fn splits_back_to_back_packets() {
+        let mut batch = packet(PacketType::Log, 1, &[0]);
+        batch.extend(packet(PacketType::Dropped, 2, &3u32.to_le_bytes()));
+        batch.extend(packet(PacketType::TimeSync, 0, &7u32.to_le_bytes()));
+        let outcomes = split_packets(&batch);
+        assert_eq!(outcomes.len(), 3);
+        let seqs: Vec<u16> = outcomes
+            .iter()
+            .map(|o| match o {
+                Outcome::Frame(f) => f.header.seq,
+                o => panic!("expected Frame, got {o:?}"),
+            })
+            .collect();
+        assert_eq!(seqs, [1, 2, 0]);
+    }
+
+    #[test]
+    fn split_stops_at_truncated_or_unframed_packets() {
+        let mut batch = packet(PacketType::Log, 1, &[0]);
+        let second = packet(PacketType::Log, 2, &[0, 0, 0]);
+        batch.extend(&second[..second.len() - 1]);
+        let outcomes = split_packets(&batch);
+        assert!(matches!(outcomes[0], Outcome::Frame(_)));
+        assert!(matches!(outcomes[1], Outcome::Truncated));
+
+        let mut legacy = make_header(1);
+        legacy.push(0);
+        assert!(matches!(split_packets(&legacy)[0], Outcome::LengthMismatch));
+        assert!(matches!(
+            split_packets(&[0x55; HEADER_LEN])[0],
+            Outcome::BadMagic
+        ));
+    }
+
+    #[test]
+    fn oversized_frame_is_not_leaked_as_text() {
+        let mut wire = vec![SLIP_START];
+        wire.extend(std::iter::repeat_n(0x55, TRANSPORT_MAX_PAYLOAD + 10));
+        wire.push(SLIP_END);
+        wire.extend_from_slice(b"ok\n");
+        let outcomes = Deframer::new().feed(&wire);
+        assert_eq!(outcomes.len(), 2, "{outcomes:?}");
+        assert!(matches!(outcomes[0], Outcome::FrameTooLong));
+        assert!(matches!(&outcomes[1], Outcome::PlainText(t) if t == b"ok\n"));
+    }
+
+    #[test]
+    fn bad_escape_skips_rest_of_frame_then_recovers() {
+        let mut wire = vec![SLIP_START, 0x01, SLIP_ESC, 0x42, 0x10, 0x20, SLIP_END];
+        wire.extend_from_slice(b"ok\n");
+        wire.extend(build_on9log_frame(&make_header(9), &[0]));
+        let outcomes = Deframer::new().feed(&wire);
+        assert_eq!(outcomes.len(), 3, "{outcomes:?}");
+        assert!(matches!(outcomes[0], Outcome::InvalidEscape));
+        assert!(matches!(&outcomes[1], Outcome::PlainText(t) if t == b"ok\n"));
+        assert!(matches!(&outcomes[2], Outcome::Frame(f) if f.header.seq == 9));
     }
 
     #[test]

@@ -175,7 +175,16 @@ magic (0x9a) | type+level | seq (u16) | time_ms (u32) | tag_id (u32) | fmt_id (u
 Format strings live in a `.noload` ELF output section at VMA 0 — kept in the
 ELF file but excluded from the flashed binary image. The host resolves
 `fmt_id` addresses against this section, and `tag_id` addresses against normal
-`.rodata` sections.
+`.rodata` sections. A tag or format the device cannot send by address (built
+at runtime) arrives inline in the packet instead (`tag_id`/`fmt_id` =
+`0xffffffff`).
+
+The device's BOOT packet carries its reset reason, wire format version and a
+firmware image ID (ELF SHA-256 on ESP-IDF, GNU build-id or Mach-O UUID on
+hosts). The CLI and capture tool compare it with the `--elf` file and print a
+bold red warning when they differ, since decoded strings would then be wrong.
+Packets sent without SLIP framing (e.g. an MQTT batch) can be parsed with
+`on9log_protocol::split_packets`.
 
 Both C `printf`-style (`%d`, `%s`, `%.*s`) and C++23 `std::format`-style
 (`{}`, `{0:>10.2f}`, `{:#x}`) format strings are supported, dispatched
@@ -211,7 +220,7 @@ MIT — see the `license` field in each crate's `Cargo.toml`.
 ## Future work
 
 - `napi-rs` binding for the protocol crate
-- TIME_SYNC / BOOT packet decoding
+- Map TIME_SYNC to host wall time for batched transports
 - Sequence-gap statistics and loss-rate reporting
 - Optional JSON output mode
 - TCP / WebSocket transport sources (the decoder is already transport-agnostic)

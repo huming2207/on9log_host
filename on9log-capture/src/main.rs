@@ -328,96 +328,109 @@ impl Renderer {
             strip_ansi,
         } = self.opts;
         match outcome {
-            Outcome::Frame(frame) => match self.decoder.decode(frame, elf) {
-                DecodedPacket::Log(l) => {
-                    let color_code = level_color(l.level);
-                    let prefix = format!(
-                        "{}{} ({:>7}) {}: ",
-                        ts_prefix(timestamp, captured_at_ms),
-                        l.level.letter(),
-                        l.meta.time_ms,
-                        l.tag
-                    );
-                    let indent = prefix.chars().count();
-                    if let Some(gap) = l.meta.gap {
-                        let msg =
-                            format!("--- missed {gap} packet(s) before seq {} ---", l.meta.seq);
-                        self.warn_line(&msg, captured_at_ms);
-                    }
-                    let message = clean_string(&l.message, strip_ansi);
-                    if to_stdout {
-                        print_log_line(&prefix, &message, color_code, indent, width, use_color);
-                    }
-                    if let Some(save) = self.save.as_mut() {
-                        let _ = save.write_line(&format!("{prefix}{message}"));
-                    }
-                    self.plain.reset_line();
-                    self.save_plain.reset_line();
-                }
-                DecodedPacket::Dropped(d) => {
-                    let msg = format!(
-                        "--- device dropped {} packet(s) at seq {} (t={}ms) ---",
-                        d.count, d.meta.seq, d.meta.time_ms
-                    );
+            Outcome::Frame(frame) => {
+                let packet = self.decoder.decode(frame, elf);
+                // Reported before any packet kind, not only logs.
+                if let Some(gap) = packet.gap() {
+                    let seq = packet.meta().map(|m| m.seq).unwrap_or_default();
+                    let msg = format!("--- missed {gap} packet(s) before seq {seq} ---");
                     self.warn_line(&msg, captured_at_ms);
-                    self.plain.reset_line();
-                    self.save_plain.reset_line();
                 }
-                DecodedPacket::Buffer(b) => {
-                    let color_code = level_color(b.level);
-                    let header = format!(
-                        "{}{} ({:>7}) {} [buf {} @{} +{}]: <buffer dump, {} bytes>",
-                        ts_prefix(timestamp, captured_at_ms),
-                        b.level.letter(),
-                        b.meta.time_ms,
-                        b.tag,
-                        b.total_len,
-                        b.offset,
-                        b.bytes.len(),
-                        b.bytes.len()
-                    );
-                    if to_stdout {
-                        if use_color {
-                            println!(
-                                "{color}{BOLD}{header}{RESET}",
-                                color = color_code,
-                                BOLD = color::BOLD,
-                                RESET = color::RESET
-                            );
-                        } else {
-                            println!("{header}");
+                match packet {
+                    DecodedPacket::Log(l) => {
+                        let color_code = level_color(l.level);
+                        let prefix = format!(
+                            "{}{} ({:>7}) {}: ",
+                            ts_prefix(timestamp, captured_at_ms),
+                            l.level.letter(),
+                            l.meta.time_ms,
+                            l.tag
+                        );
+                        let indent = prefix.chars().count();
+                        let message = clean_string(&l.message, strip_ansi);
+                        if to_stdout {
+                            print_log_line(&prefix, &message, color_code, indent, width, use_color);
                         }
+                        if let Some(save) = self.save.as_mut() {
+                            let _ = save.write_line(&format!("{prefix}{message}"));
+                        }
+                        self.plain.reset_line();
+                        self.save_plain.reset_line();
                     }
-                    if let Some(save) = self.save.as_mut() {
-                        let _ = save.write_line(&header);
+                    DecodedPacket::Dropped(d) => {
+                        let msg = format!(
+                            "--- device dropped {} packet(s) at seq {} (t={}ms) ---",
+                            d.count, d.meta.seq, d.meta.time_ms
+                        );
+                        self.warn_line(&msg, captured_at_ms);
+                        self.plain.reset_line();
+                        self.save_plain.reset_line();
                     }
-                    if to_stdout {
-                        print_hexdump(&b.bytes, color_code, use_color, timestamp, captured_at_ms);
+                    DecodedPacket::Buffer(b) => {
+                        let color_code = level_color(b.level);
+                        let header = format!(
+                            "{}{} ({:>7}) {} [buf {} @{} +{}]: <buffer dump, {} bytes>",
+                            ts_prefix(timestamp, captured_at_ms),
+                            b.level.letter(),
+                            b.meta.time_ms,
+                            b.tag,
+                            b.total_len,
+                            b.offset,
+                            b.bytes.len(),
+                            b.bytes.len()
+                        );
+                        if to_stdout {
+                            if use_color {
+                                println!(
+                                    "{color}{BOLD}{header}{RESET}",
+                                    color = color_code,
+                                    BOLD = color::BOLD,
+                                    RESET = color::RESET
+                                );
+                            } else {
+                                println!("{header}");
+                            }
+                        }
+                        if let Some(save) = self.save.as_mut() {
+                            let _ = save.write_line(&header);
+                        }
+                        if to_stdout {
+                            print_hexdump(
+                                &b.bytes,
+                                color_code,
+                                use_color,
+                                timestamp,
+                                captured_at_ms,
+                            );
+                        }
+                        if let Some(save) = self.save.as_mut() {
+                            let _ =
+                                write_hexdump_to_file(save, &b.bytes, timestamp, captured_at_ms);
+                        }
+                        self.plain.reset_line();
+                        self.save_plain.reset_line();
                     }
-                    if let Some(save) = self.save.as_mut() {
-                        let _ = write_hexdump_to_file(save, &b.bytes, timestamp, captured_at_ms);
+                    DecodedPacket::Boot(b) => {
+                        if b.is_problem() {
+                            self.alarm_line(&b.summary(), captured_at_ms);
+                        } else {
+                            self.warn_line(&b.summary(), captured_at_ms);
+                        }
+                        self.plain.reset_line();
+                        self.save_plain.reset_line();
                     }
-                    self.plain.reset_line();
-                    self.save_plain.reset_line();
+                    DecodedPacket::TimeSync(t) => {
+                        eprintln!(
+                            "on9log-capture: time sync boot_id=0x{:08x} device t={}ms",
+                            t.boot_id, t.time_ms
+                        );
+                    }
+                    DecodedPacket::Malformed { meta, reason } => {
+                        let seq = meta.as_ref().map(|m| m.seq.to_string()).unwrap_or_default();
+                        eprintln!("on9log-capture: malformed packet seq {seq}: {reason}");
+                    }
                 }
-                DecodedPacket::Other {
-                    meta,
-                    kind,
-                    payload,
-                    ..
-                } => {
-                    eprintln!(
-                        "on9log-capture: {kind} packet seq {} t={}ms ({} bytes)",
-                        meta.seq,
-                        meta.time_ms,
-                        payload.len()
-                    );
-                }
-                DecodedPacket::Malformed { meta, reason } => {
-                    let seq = meta.as_ref().map(|m| m.seq.to_string()).unwrap_or_default();
-                    eprintln!("on9log-capture: malformed packet seq {seq}: {reason}");
-                }
-            },
+            }
             Outcome::BadMagic => {
                 eprintln!("on9log-capture: frame with bad magic discarded")
             }
@@ -481,6 +494,37 @@ impl Renderer {
     /// Print a dim, yellow warning/progress line, optionally prefixed with
     /// the captured-at timestamp. The message is ANSI-stripped if the renderer
     /// is configured for stripping.
+    /// Like `warn_line`, but bold red: decoded output can no longer be trusted
+    /// (for example the ELF does not match the device).
+    fn alarm_line(&mut self, msg: &str, captured_at_ms: u64) {
+        let RenderOptions {
+            use_color,
+            timestamp,
+            to_stdout,
+            strip_ansi,
+            ..
+        } = self.opts;
+        let msg = clean_string(
+            &format!("{}{}", ts_prefix(timestamp, captured_at_ms), msg),
+            strip_ansi,
+        );
+        if to_stdout {
+            if use_color {
+                println!(
+                    "{BOLD}{RED}{msg}{RESET}",
+                    BOLD = color::BOLD,
+                    RED = color::RED,
+                    RESET = color::RESET
+                );
+            } else {
+                println!("{msg}");
+            }
+        }
+        if let Some(save) = self.save.as_mut() {
+            let _ = save.write_line(&msg);
+        }
+    }
+
     fn warn_line(&mut self, msg: &str, captured_at_ms: u64) {
         let RenderOptions {
             use_color,

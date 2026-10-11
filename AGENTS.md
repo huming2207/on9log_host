@@ -40,7 +40,7 @@ seq          u16  wraps naturally
 time_ms      u32  milliseconds since boot, wraps naturally
 tag_id       u32  tag string address in ELF
 fmt_id       u32  format string address in ELF
-payload_len  u16  bytes after header, or 0xffff for streaming
+payload_len  u16  exact bytes after header (0xffff only from pre-v1 firmware)
 ```
 
 Packet types (`ON9LOG_PKT_*`):
@@ -146,6 +146,22 @@ uint32_t chunk_len
 uint8_t  bytes[chunk_len]
 ```
 
+Wire format v1 (`ON9LOG_WIRE_FORMAT_VERSION`, reported in BOOT) adds:
+
+- **Inline strings.** `tag_id` / `fmt_id` = `0xffffffff` (`ID_INLINE`) means the
+  firmware could not send that string by address (stack, heap, runtime format).
+  The LOG or BUFFER payload then starts with the inline tag, then the inline
+  format, each `u32 len + bytes`, before the normal payload. An inline format
+  renders without an ELF.
+- **BOOT**: `u32 boot_id | u8 reset_reason | u8 wire_version | u8 image_id_kind |
+  u8 image_id_len | image_id` (pre-v1 firmware sent only the first 5 bytes).
+  Image ID kinds: 1 SHA-256 of the whole ELF file (ESP-IDF), 2 GNU build-id
+  note, 3 Mach-O `LC_UUID`. The decoder compares it with the loaded ELF.
+- **TIME_SYNC**: payload `u32 boot_id`, device time in the header. Built outside
+  the sink path; its `seq` is always 0 and is not part of the sequence.
+
+LOG, BUFFER, DROPPED and BOOT share the `seq` counter. A BOOT restarts it.
+
 A DROPPED packet payload is `uint32_t dropped_count` (device-side logger drops,
 distinct from transport loss detected by sequence gaps).
 
@@ -207,7 +223,7 @@ let elf = ElfStrings::from_bytes(&elf_bytes).ok();
 for outcome in deframer.feed(&uart_bytes) {
     if let Outcome::Frame(frame) = outcome {
         let pkt = decoder.decode(&frame, elf.as_ref());
-        // match on DecodedPacket::Log / Buffer / Dropped / Other / Malformed
+        // match on DecodedPacket::Log / Buffer / Dropped / Boot / TimeSync / Malformed
     }
 }
 ```
@@ -250,10 +266,17 @@ the partial frame is discarded and a fresh frame begins.
 - `Outcome::UnknownFrameType(_)` — verified frame type was not `0x01` or `0x02`;
 - `Outcome::InvalidEscape` — bad SLIP escape sequence.
 
-Non-Frame outcomes never halt decoding. Bad SLIP frames are reported and the
-deframer returns to start-marker hunt mode. For non-streaming on9log packets
+Non-Frame outcomes never halt decoding. After `FrameTooLong` or
+`InvalidEscape` the deframer skips the rest of that frame until its end marker
+or the next start marker, so the broken frame's binary bytes are never
+surfaced as plain text; it then returns to start-marker hunt mode. For non-streaming on9log packets
 (`payload_len != 0xffff`) the deframer also checks that the payload length
 matches the declared value.
+
+`split_packets(&[u8])` parses back-to-back packets with no SLIP/CRC framing,
+such as one MQTT or WebSocket message from a batching transport, using each
+packet's exact `payload_len`. Without framing it cannot resynchronise, so it
+stops at the first truncated, unparseable or pre-v1 (`0xffff`) packet.
 
 `elf_resolv.rs` parses firmware ELF and Unix ELF/Mach-O images with goblin and builds an
 address-indexed table of string-bearing sections and function symbols. When
@@ -393,15 +416,26 @@ micro-optimizations until a benchmark shows parsed-plan caching is insufficient.
 sequence gaps using wrapping arithmetic (`gap = seq - (last + 1)`, correct across
 `u16` wrap). It dispatches each packet type:
 
-- LOG -> parse arg type table, decode args, resolve tag/fmt, render message;
-- BUFFER -> parse total_len/offset/chunk_len, carry the raw bytes;
+- LOG -> read any inline tag/format, parse arg type table, decode args, resolve
+  tag/fmt (inline or via ELF), render message;
+- BUFFER -> read any inline tag, parse total_len/offset/chunk_len, carry the raw
+  bytes;
 - DROPPED -> parse the dropped count;
-- TIME_SYNC / BOOT -> surfaced as `DecodedPacket::Other` with the raw payload
-  (the firmware does not currently emit these, but they are reserved for forward
-  compatibility);
+- BOOT -> `BootRecord`: boot id, reset reason, wire version, image ID and
+  `ImageCheck` (`Match`, `Mismatch`, `NoElf`, `NotReported`, ...) against
+  `ElfStrings::image_id()`. A BOOT resets sequence tracking first, so a device
+  reboot does not look like ~65k lost packets. `BootRecord::summary()` and
+  `is_problem()` give the CLI and capture tool one shared description;
+- TIME_SYNC -> `TimeSyncRecord`, decoded without touching sequence tracking;
 - any decode failure -> `DecodedPacket::Malformed { meta, reason }`.
 
-`Decoder::reset()` clears sequence tracking (e.g. after a device reboot).
+`DecodedPacket::gap()` reports missed packets before any packet kind; the CLI
+and capture tool print it before every packet, not only logs.
+`Decoder::reset()` clears sequence tracking (also used after a host-initiated
+target reset). `ElfStrings` computes the image IDs once at load: SHA-256 of
+the file, the `NT_GNU_BUILD_ID` note (note sections first, then `PT_NOTE`
+segments) and the Mach-O `LC_UUID`. The ID only catches a mismatched ELF; it is
+self-reported by the device and is not authentication.
 
 The following modules live in `on9log-cli/src`.
 
@@ -649,11 +683,11 @@ warnings`, but these review findings are still open:
   argument count and argument bodies, but it does not currently reject extra bytes
   left at the end of the payload. BUFFER and DROPPED packets already check exact
   lengths.
-- **Formatter correctness depends on firmware ABI assumptions.** `printf.rs`
-  assumes the ESP32 32-bit ABI for default `int`, `long`, `size_t`, pointers, and
-  `ptrdiff_t`, and delegates conversion behavior to the `sprintf` crate. It is
-  suitable for the current ESP32-S3 target, but it is not a general cross-target
-  printf implementation.
+- **Formatter correctness depends on the wire's width tags.** `printf.rs` takes
+  integer width from the argument's wire type (32- or 64-bit), with `hh`/`h`
+  still narrowing, so `long`/`size_t` render correctly on ILP32 targets
+  (ESP32, Cortex-M) and LP64 hosts alike. It delegates conversion behavior to
+  the `sprintf` crate and is not a complete printf implementation.
 - **Unsupported or unusual printf conversions render as errors.** On a
   `sprintf` error the CLI preserves the log by printing `<render error: ...>` plus
   the original format string. This is intentional recovery, not complete printf
@@ -859,9 +893,9 @@ cargo build --release
 
 - `napi-rs` binding exposing `on9log_protocol::{Deframer, Decoder, ElfStrings}`
   and the decoded record types to Node.js.
-- TIME_SYNC / BOOT packet decoding once the firmware emits them (currently
-  surfaced as opaque `Other` payloads). Time sync would let the host map
-  boot-relative `time_ms` to UTC.
+- Use TIME_SYNC to map boot-relative `time_ms` to host wall time for batched
+  transports (decoding exists; mapping does not).
+- Store each BOOT's image ID in the capture database so replays can check it.
 - Optional sequence-gap statistics / loss-rate reporting.
 - Optional JSON output mode for piping into other tooling.
 - TCP / WebSocket transport sources alongside UART/file/stdin (the decoder is

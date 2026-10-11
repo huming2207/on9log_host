@@ -402,50 +402,45 @@ fn value_to_owned(len: Length, conv: char, arg: &Arg) -> Owned {
         Arg::Ptr(v) => match conv {
             'p' => Owned::Ptr(*v as *const u8),
             // Non-%p use of a pointer address: treat as a 32-bit value.
-            'd' | 'i' => signed_int(*v as u64, len),
-            _ => unsigned_int(*v as u64, len),
+            'd' | 'i' => signed_int(*v as u64, false, len),
+            _ => unsigned_int(*v as u64, false, len),
         },
         Arg::U32(v) => match conv {
-            'd' | 'i' => signed_int(*v as u64, len),
+            'd' | 'i' => signed_int(*v as u64, false, len),
             'p' => Owned::Ptr(*v as *const u8),
-            _ => unsigned_int(*v as u64, len),
+            _ => unsigned_int(*v as u64, false, len),
         },
         Arg::U64(v) => match conv {
-            'd' | 'i' => signed_int(*v, len),
+            'd' | 'i' => signed_int(*v, true, len),
             'f' | 'F' | 'e' | 'E' | 'g' | 'G' => Owned::F64(f64::from_bits(*v)),
             'p' => Owned::Ptr(*v as usize as *const u8),
-            _ => unsigned_int(*v, len),
+            _ => unsigned_int(*v, true, len),
         },
     }
 }
 
-/// Cast a raw `u64` value to the signed integer width indicated by `len`.
+/// Cast a raw value to a signed integer.
 ///
-/// On ESP32 targets, `long`, `size_t`, and `ptrdiff_t` are 32 bits wide.
-fn signed_int(v: u64, len: Length) -> Owned {
+/// The wire already records whether the argument was 32 or 64 bits wide
+/// (`wide`), so that decides the width: `long`, `size_t` and `ptrdiff_t` are
+/// 32 bits on ESP32/Cortex-M but 64 bits on an LP64 host, and only the wire
+/// knows which. `hh` and `h` still narrow, as C's promotion rules require.
+fn signed_int(v: u64, wide: bool, len: Length) -> Owned {
     match len {
         Length::Char => Owned::I8(v as u8 as i8),
         Length::Short => Owned::I16(v as u16 as i16),
-        Length::LongLong | Length::IntMax => Owned::I64(v as i64),
-        // ESP32 targets are 32-bit; long, size_t and ptrdiff_t are 32-bit.
-        Length::Default | Length::Long | Length::Size | Length::PtrDiff | Length::LongDouble => {
-            Owned::I32(v as u32 as i32)
-        }
+        _ if wide => Owned::I64(v as i64),
+        _ => Owned::I32(v as u32 as i32),
     }
 }
 
-/// Cast a raw `u64` value to the unsigned integer width indicated by `len`.
-///
-/// On ESP32 targets, `long`, `size_t`, and `ptrdiff_t` are 32 bits wide.
-fn unsigned_int(v: u64, len: Length) -> Owned {
+/// Cast a raw value to an unsigned integer; see [`signed_int`] for the width rule.
+fn unsigned_int(v: u64, wide: bool, len: Length) -> Owned {
     match len {
         Length::Char => Owned::U8(v as u8),
         Length::Short => Owned::U16(v as u16),
-        Length::LongLong | Length::IntMax => Owned::U64(v),
-        // ESP32 targets are 32-bit; long, size_t and ptrdiff_t are 32-bit.
-        Length::Default | Length::Long | Length::Size | Length::PtrDiff | Length::LongDouble => {
-            Owned::U32(v as u32)
-        }
+        _ if wide => Owned::U64(v),
+        _ => Owned::U32(v as u32),
     }
 }
 
@@ -579,6 +574,23 @@ mod tests {
         assert_eq!(s.len(), MAX_RENDER_COUNT + 4);
         assert!(s.starts_with("[1."));
         assert!(s.ends_with(']'));
+    }
+
+    #[test]
+    fn integer_width_follows_the_wire() {
+        // LP64 host: `long` and `size_t` arrive as 64-bit arguments.
+        assert_eq!(render("%ld", &[Arg::U64(5_000_000_000)]), "5000000000");
+        assert_eq!(render("%zu", &[Arg::U64(5_000_000_000)]), "5000000000");
+        assert_eq!(
+            render("%ld", &[Arg::U64((-5_000_000_000i64) as u64)]),
+            "-5000000000"
+        );
+        // ESP32: `long` is 32-bit on the wire, and a 32-bit value stays 32-bit
+        // even under `%lld`, so its sign is preserved.
+        assert_eq!(render("%ld", &[Arg::U32(0xffff_ffff)]), "-1");
+        assert_eq!(render("%lld", &[Arg::U32(0xffff_ffff)]), "-1");
+        // `hh`/`h` still narrow.
+        assert_eq!(render("%hhd", &[Arg::U64(0x1ff)]), "-1");
     }
 
     #[test]

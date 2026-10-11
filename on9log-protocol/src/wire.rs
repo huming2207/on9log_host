@@ -5,8 +5,18 @@
 
 /// Magic byte that begins every on9log packet header.
 pub const PACKET_MAGIC: u8 = 0x9a;
-/// Special payload-length value indicating a streaming (indeterminate-length) packet.
+/// Reserved payload length meaning "unknown". Wire format v1 firmware always
+/// sends the exact length; only older firmware used this value.
 pub const PAYLOAD_LEN_STREAMING: u16 = 0xffff;
+/// `tag_id` / `fmt_id` value meaning the string is copied into the payload.
+///
+/// The payload then starts with the inline tag (if any) followed by the inline
+/// format (if any), each as a `u32` length and that many bytes.
+pub const ID_INLINE: u32 = 0xffff_ffff;
+/// Newest wire format version this decoder understands (`ON9LOG_WIRE_FORMAT_VERSION`).
+pub const WIRE_FORMAT_VERSION: u8 = 1;
+/// Longest firmware image ID a BOOT packet carries.
+pub const IMAGE_ID_MAX_LEN: usize = 32;
 /// Size of a parsed on9log packet header in bytes.
 pub const HEADER_LEN: usize = 18;
 /// Sentinel length value representing a null dynamic string.
@@ -47,9 +57,10 @@ pub enum PacketType {
     Log = 0,
     /// Notification that the device dropped one or more log packets.
     Dropped = 1,
-    /// Time-synchronisation packet (reserved, not currently emitted).
+    /// Time-synchronisation packet appended by batching transports. Not part of
+    /// the sequence: its `seq` is always 0 and must not be gap-checked.
     TimeSync = 2,
-    /// Boot event packet (reserved, not currently emitted).
+    /// Boot event: reset reason, wire format version and firmware image ID.
     Boot = 3,
     /// Buffer-dump packet carrying a chunk of a memory/binary buffer.
     Buffer = 4,
@@ -147,6 +158,69 @@ impl ArgType {
     }
 }
 
+/// What a BOOT packet's image ID is (`on9log_image_id_kind_t`), which tells the
+/// host how to compute the same value from its ELF.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageIdKind {
+    /// No ID was available on the device.
+    None,
+    /// SHA-256 of the whole ELF file (ESP-IDF `app_elf_sha256`).
+    ElfSha256,
+    /// Contents of the ELF `NT_GNU_BUILD_ID` note.
+    GnuBuildId,
+    /// Mach-O `LC_UUID` of the main image.
+    MachoUuid,
+    /// A kind this decoder does not know.
+    Unknown(u8),
+}
+
+impl ImageIdKind {
+    /// Convert a raw byte to an [`ImageIdKind`].
+    pub fn from_byte(b: u8) -> Self {
+        match b {
+            0 => Self::None,
+            1 => Self::ElfSha256,
+            2 => Self::GnuBuildId,
+            3 => Self::MachoUuid,
+            other => Self::Unknown(other),
+        }
+    }
+
+    /// Short human-readable name.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::ElfSha256 => "ELF SHA-256",
+            Self::GnuBuildId => "GNU build-id",
+            Self::MachoUuid => "Mach-O UUID",
+            Self::Unknown(_) => "unknown",
+        }
+    }
+}
+
+/// Name of an `on9log_reset_reason_t` value carried in a BOOT packet.
+pub fn reset_reason_name(reason: u8) -> &'static str {
+    match reason {
+        0 => "unknown",
+        1 => "power-on",
+        2 => "external pin",
+        3 => "software",
+        4 => "panic",
+        5 => "interrupt watchdog",
+        6 => "task watchdog",
+        7 => "other watchdog",
+        8 => "deep sleep",
+        9 => "brownout",
+        10 => "SDIO",
+        11 => "USB",
+        12 => "JTAG",
+        13 => "eFuse error",
+        14 => "power glitch",
+        15 => "CPU lockup",
+        _ => "unrecognised",
+    }
+}
+
 /// Parsed 18-byte packet header.
 #[derive(Debug, Clone, Copy)]
 pub struct Header {
@@ -160,11 +234,12 @@ pub struct Header {
     pub seq: u16,
     /// Timestamp in milliseconds since device boot.
     pub time_ms: u32,
-    /// Address of the tag string in ELF memory.
+    /// Address of the tag string in ELF memory, or [`ID_INLINE`].
     pub tag_id: u32,
-    /// Address of the format string in ELF memory.
+    /// Address of the format string in ELF memory, or [`ID_INLINE`].
     pub fmt_id: u32,
-    /// Length of the payload following the header (or [`PAYLOAD_LEN_STREAMING`]).
+    /// Exact length of the payload following the header ([`PAYLOAD_LEN_STREAMING`]
+    /// only from pre-v1 firmware).
     pub payload_len: u16,
 }
 

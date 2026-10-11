@@ -41,12 +41,15 @@ pub(crate) const MAX_RENDER_COUNT: usize = 4096;
 /// Re-export [`CrashDecoder`] — a streaming panic-text annotator for ESP-IDF crashes.
 pub use crash::CrashDecoder;
 /// Re-export core decode API: [`Decoder`], [`DecodedPacket`], and record types.
-pub use decode::{BufferRecord, DecodedPacket, Decoder, DroppedRecord, LogRecord, PacketMeta};
+pub use decode::{
+    BootRecord, BufferRecord, DecodedPacket, Decoder, DroppedRecord, ImageCheck, LogRecord,
+    PacketMeta, TimeSyncRecord,
+};
 /// Re-export ELF resolution types for string and symbol lookups.
 pub use elf_resolv::{ElfStrings, ResolvedSymbol, SourceLocation};
 /// Re-export transport deframing types: [`Deframer`], [`Outcome`], [`RawFrame`].
-pub use framer::{Deframer, Outcome, RawFrame};
+pub use framer::{Deframer, Outcome, RawFrame, split_packets};
 /// Re-export printf-style argument type and top-level dispatch renderer.
 pub use printf::{Arg, render_format};
 /// Re-export wire protocol primitives: [`ArgType`], [`Header`], [`Level`], [`PacketType`].
-pub use wire::{ArgType, Header, Level, PacketType};
+pub use wire::{ArgType, Header, ImageIdKind, Level, PacketType};

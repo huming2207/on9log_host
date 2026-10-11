@@ -10,10 +10,13 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use goblin::{
     Object,
-    elf::{Elf, SectionHeader, sym::STT_FUNC},
-    mach::{Mach, MachO, symbols::N_SECT},
+    elf::{Elf, SectionHeader, note::NT_GNU_BUILD_ID, sym::STT_FUNC},
+    mach::{Mach, MachO, load_command::CommandVariant, symbols::N_SECT},
     strtab::Strtab,
 };
+use sha2::{Digest, Sha256};
+
+use crate::wire::ImageIdKind;
 
 /// Address-indexed executable-image string table.
 ///
@@ -30,6 +33,19 @@ pub struct ElfStrings {
     /// Runtime image slide reduced to the 32-bit address width carried on the
     /// wire. Zero for ESP ELF images and non-PIE host executables.
     address_slide: AtomicU32,
+    /// IDs of this image, compared with the one a BOOT packet reports.
+    image_ids: ImageIds,
+}
+
+/// The firmware image IDs this file can be matched against.
+#[derive(Default)]
+struct ImageIds {
+    /// SHA-256 of the whole file.
+    file_sha256: Option<[u8; 32]>,
+    /// `NT_GNU_BUILD_ID` note contents (ELF only).
+    gnu_build_id: Option<Vec<u8>>,
+    /// `LC_UUID` (Mach-O only).
+    macho_uuid: Option<[u8; 16]>,
 }
 
 /// An ELF section with its virtual-address range and file-backed data.
@@ -85,6 +101,7 @@ impl ElfStrings {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
         let mut sections = Vec::new();
         let mut symbols = Vec::new();
+        let mut image_ids = ImageIds::default();
         match Object::parse(bytes).map_err(|e| format!("executable parse: {e}"))? {
             Object::Elf(elf) => {
                 for sh in &elf.section_headers {
@@ -92,16 +109,23 @@ impl ElfStrings {
                     collect_section(bytes, sh, name, &mut sections);
                 }
                 collect_symbols(&elf, &mut symbols);
+                image_ids.gnu_build_id = find_gnu_build_id(&elf, bytes);
             }
             Object::Mach(Mach::Binary(mach)) => {
                 collect_mach_sections(&mach, &mut sections)?;
                 collect_mach_symbols(&mach, &mut symbols);
+                image_ids.macho_uuid = mach.load_commands.iter().find_map(|lc| match &lc.command {
+                    CommandVariant::Uuid(uuid) => Some(uuid.uuid),
+                    _ => None,
+                });
             }
             Object::Mach(Mach::Fat(_)) => {
                 return Err("fat Mach-O images are not supported; use a thin executable".into());
             }
             _ => return Err("unsupported executable format; expected ELF or Mach-O".into()),
         }
+
+        image_ids.file_sha256 = Some(Sha256::digest(bytes).into());
 
         // Sort by start address; drop overlaps by preferring earlier entry.
         sections.sort_by_key(|s| s.addr);
@@ -111,7 +135,22 @@ impl ElfStrings {
             symbols,
             lines: None,
             address_slide: AtomicU32::new(0),
+            image_ids,
         })
+    }
+
+    /// This image's ID of the given kind, for comparison with a BOOT packet.
+    ///
+    /// `ElfSha256` is the SHA-256 of the whole file as loaded; `GnuBuildId` and
+    /// `MachoUuid` come from the ELF note and Mach-O load command. Returns
+    /// `None` when the file has no such ID.
+    pub fn image_id(&self, kind: ImageIdKind) -> Option<&[u8]> {
+        match kind {
+            ImageIdKind::ElfSha256 => self.image_ids.file_sha256.as_ref().map(|id| id.as_slice()),
+            ImageIdKind::GnuBuildId => self.image_ids.gnu_build_id.as_deref(),
+            ImageIdKind::MachoUuid => self.image_ids.macho_uuid.as_ref().map(|id| id.as_slice()),
+            ImageIdKind::None | ImageIdKind::Unknown(_) => None,
+        }
     }
 
     /// Parse an ELF or Mach-O file from disk and enable source location lookups.
@@ -252,6 +291,25 @@ impl Section {
         }
         std::str::from_utf8(&bytes[..end]).ok()
     }
+}
+
+/// Find the `NT_GNU_BUILD_ID` note, looking in note sections first (bare-metal
+/// images may keep `.note.gnu.build-id` in a loaded section rather than a
+/// `PT_NOTE` segment) and then in `PT_NOTE` segments.
+fn find_gnu_build_id(elf: &Elf<'_>, bytes: &[u8]) -> Option<Vec<u8>> {
+    let is_build_id = |note: &goblin::elf::note::Note<'_>| {
+        note.n_type == NT_GNU_BUILD_ID
+            && note.name.trim_end_matches('\0') == "GNU"
+            && !note.desc.is_empty()
+    };
+    let from_sections = elf.iter_note_sections(bytes, None).and_then(|mut notes| {
+        notes.find_map(|n| n.ok().filter(is_build_id).map(|n| n.desc.to_vec()))
+    });
+    from_sections.or_else(|| {
+        elf.iter_note_headers(bytes).and_then(|mut notes| {
+            notes.find_map(|n| n.ok().filter(is_build_id).map(|n| n.desc.to_vec()))
+        })
+    })
 }
 
 /// Check whether a section name identifies it as an ESP-IDF no-load section
@@ -410,6 +468,7 @@ mod tests {
             symbols: Vec::new(),
             lines: None,
             address_slide: AtomicU32::new(0),
+            image_ids: ImageIds::default(),
         };
 
         assert_eq!(strings.read_format(4), Some("fmt"));
@@ -429,6 +488,7 @@ mod tests {
             symbols: Vec::new(),
             lines: None,
             address_slide: AtomicU32::new(0),
+            image_ids: ImageIds::default(),
         };
 
         assert_eq!(strings.read_format(0x3f00_0000), Some("value={}"));
@@ -459,6 +519,7 @@ mod tests {
             symbols: Vec::new(),
             lines: None,
             address_slide: AtomicU32::new(0),
+            image_ids: ImageIds::default(),
         };
 
         assert_eq!(strings.read_format(4), None);
@@ -482,6 +543,7 @@ mod tests {
             ],
             lines: None,
             address_slide: AtomicU32::new(0),
+            image_ids: ImageIds::default(),
         };
 
         assert_eq!(

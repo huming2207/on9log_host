@@ -893,104 +893,106 @@ fn handle_outcome(
         timestamp,
     } = opts;
     match outcome {
-        Outcome::Frame(frame) => match state.decoder.decode(&frame, elf) {
-            DecodedPacket::Log(l) => {
-                let color_code = level_color(l.level);
-                let prefix = format!(
-                    "{}{} ({:>7}) {}: ",
-                    timestamp_prefix(timestamp),
-                    l.level.letter(),
-                    l.meta.time_ms,
-                    l.tag
-                );
-                let indent = prefix.chars().count();
-                if let Some(gap) = l.meta.gap {
-                    let msg = format!("--- missed {gap} packet(s) before seq {} ---", l.meta.seq);
-                    warn_line(&msg, use_color, timestamp);
-                    broadcast_log(web_log, format!("{}{}", timestamp_prefix(timestamp), msg));
-                    if let Some(save) = save.as_deref_mut() {
-                        let _ = save.write_line(&format!("{}{}", timestamp_prefix(timestamp), msg));
-                    }
-                }
-                term::print_log_line(&prefix, &l.message, color_code, indent, width, use_color);
-                broadcast_log(web_log, format!("{prefix}{}", l.message));
-                if let Some(save) = save.as_deref_mut() {
-                    let _ = save.write_line(&format!("{prefix}{}", l.message));
-                }
-                state.plain_text.reset_line();
-                state.save_plain_text.reset_line();
-                state.web_plain_text.reset_line();
+        Outcome::Frame(frame) => {
+            let packet = state.decoder.decode(&frame, elf);
+            // Reported before any packet kind, not only logs.
+            if let Some(gap) = packet.gap() {
+                let seq = packet.meta().map(|m| m.seq).unwrap_or_default();
+                let msg = format!("--- missed {gap} packet(s) before seq {seq} ---");
+                report_line(&msg, false, opts, web_log, save.as_deref_mut());
             }
-            DecodedPacket::Dropped(d) => {
-                let msg = format!(
-                    "--- device dropped {} packet(s) at seq {} (t={}ms) ---",
-                    d.count, d.meta.seq, d.meta.time_ms
-                );
-                warn_line(&msg, use_color, timestamp);
-                broadcast_log(web_log, format!("{}{}", timestamp_prefix(timestamp), msg));
-                if let Some(save) = save.as_deref_mut() {
-                    let _ = save.write_line(&format!("{}{}", timestamp_prefix(timestamp), msg));
-                }
-                state.plain_text.reset_line();
-                state.save_plain_text.reset_line();
-                state.web_plain_text.reset_line();
-            }
-            DecodedPacket::Buffer(b) => {
-                let color_code = level_color(b.level);
-                let header = format!(
-                    "{}{} ({:>7}) {} [buf {} @{} +{}]: <buffer dump, {} bytes>",
-                    timestamp_prefix(timestamp),
-                    b.level.letter(),
-                    b.meta.time_ms,
-                    b.tag,
-                    b.total_len,
-                    b.offset,
-                    b.bytes.len(),
-                    b.bytes.len()
-                );
-                if use_color {
-                    println!(
-                        "{color}{BOLD}{header}{RESET}",
-                        color = color_code,
-                        BOLD = color::BOLD,
-                        RESET = color::RESET
+            match packet {
+                DecodedPacket::Log(l) => {
+                    let color_code = level_color(l.level);
+                    let prefix = format!(
+                        "{}{} ({:>7}) {}: ",
+                        timestamp_prefix(timestamp),
+                        l.level.letter(),
+                        l.meta.time_ms,
+                        l.tag
                     );
-                } else {
-                    println!("{header}");
+                    let indent = prefix.chars().count();
+                    term::print_log_line(&prefix, &l.message, color_code, indent, width, use_color);
+                    broadcast_log(web_log, format!("{prefix}{}", l.message));
+                    if let Some(save) = save.as_deref_mut() {
+                        let _ = save.write_line(&format!("{prefix}{}", l.message));
+                    }
+                    state.plain_text.reset_line();
+                    state.save_plain_text.reset_line();
+                    state.web_plain_text.reset_line();
                 }
-                broadcast_log(web_log, header.clone());
-                if let Some(save) = save.as_deref_mut() {
-                    let _ = save.write_line(&header);
+                DecodedPacket::Dropped(d) => {
+                    let msg = format!(
+                        "--- device dropped {} packet(s) at seq {} (t={}ms) ---",
+                        d.count, d.meta.seq, d.meta.time_ms
+                    );
+                    report_line(&msg, false, opts, web_log, save.as_deref_mut());
+                    state.plain_text.reset_line();
+                    state.save_plain_text.reset_line();
+                    state.web_plain_text.reset_line();
                 }
-                print_hexdump(&b.bytes, color_code, use_color, timestamp);
-                for line in hexdump_lines(&b.bytes, timestamp) {
-                    broadcast_log(web_log, line);
+                DecodedPacket::Buffer(b) => {
+                    let color_code = level_color(b.level);
+                    let header = format!(
+                        "{}{} ({:>7}) {} [buf {} @{} +{}]: <buffer dump, {} bytes>",
+                        timestamp_prefix(timestamp),
+                        b.level.letter(),
+                        b.meta.time_ms,
+                        b.tag,
+                        b.total_len,
+                        b.offset,
+                        b.bytes.len(),
+                        b.bytes.len()
+                    );
+                    if use_color {
+                        println!(
+                            "{color}{BOLD}{header}{RESET}",
+                            color = color_code,
+                            BOLD = color::BOLD,
+                            RESET = color::RESET
+                        );
+                    } else {
+                        println!("{header}");
+                    }
+                    broadcast_log(web_log, header.clone());
+                    if let Some(save) = save.as_deref_mut() {
+                        let _ = save.write_line(&header);
+                    }
+                    print_hexdump(&b.bytes, color_code, use_color, timestamp);
+                    for line in hexdump_lines(&b.bytes, timestamp) {
+                        broadcast_log(web_log, line);
+                    }
+                    if let Some(save) = save.as_deref_mut() {
+                        let _ = write_hexdump_to_file(save, &b.bytes, timestamp);
+                    }
+                    state.plain_text.reset_line();
+                    state.save_plain_text.reset_line();
+                    state.web_plain_text.reset_line();
                 }
-                if let Some(save) = save.as_deref_mut() {
-                    let _ = write_hexdump_to_file(save, &b.bytes, timestamp);
+                DecodedPacket::Boot(b) => {
+                    report_line(
+                        &b.summary(),
+                        b.is_problem(),
+                        opts,
+                        web_log,
+                        save.as_deref_mut(),
+                    );
+                    state.plain_text.reset_line();
+                    state.save_plain_text.reset_line();
+                    state.web_plain_text.reset_line();
                 }
-                state.plain_text.reset_line();
-                state.save_plain_text.reset_line();
-                state.web_plain_text.reset_line();
+                DecodedPacket::TimeSync(t) => {
+                    eprintln!(
+                        "on9log: time sync boot_id=0x{:08x} device t={}ms",
+                        t.boot_id, t.time_ms
+                    );
+                }
+                DecodedPacket::Malformed { meta, reason } => {
+                    let seq = meta.as_ref().map(|m| m.seq.to_string()).unwrap_or_default();
+                    eprintln!("on9log: malformed packet seq {seq}: {reason}");
+                }
             }
-            DecodedPacket::Other {
-                meta,
-                kind,
-                payload,
-                ..
-            } => {
-                eprintln!(
-                    "on9log: {kind} packet seq {} t={}ms ({} bytes)",
-                    meta.seq,
-                    meta.time_ms,
-                    payload.len()
-                );
-            }
-            DecodedPacket::Malformed { meta, reason } => {
-                let seq = meta.as_ref().map(|m| m.seq.to_string()).unwrap_or_default();
-                eprintln!("on9log: malformed packet seq {seq}: {reason}");
-            }
-        },
+        }
         Outcome::BadMagic => eprintln!("on9log: frame with bad magic discarded"),
         Outcome::CrcMismatch => eprintln!("on9log: frame failed CRC, discarded"),
         Outcome::Truncated => eprintln!("on9log: truncated frame discarded"),
@@ -1068,6 +1070,43 @@ enum AnsiStripState {
 
 /// Print a dim, yellow warning/progress line to stdout (with optional
 /// timestamp and ANSI coloring).
+/// Print a stream notice (gap, drop, boot) and copy it to the web UI and save
+/// file. `alarm` marks something that makes the output untrustworthy, such as
+/// an ELF that does not match the device; it is printed in bold red.
+fn report_line(
+    msg: &str,
+    alarm: bool,
+    opts: RenderOptions,
+    web_log: Option<&web::LogSender>,
+    save: Option<&mut SaveLog>,
+) {
+    if alarm {
+        alarm_line(msg, opts.use_color, opts.timestamp);
+    } else {
+        warn_line(msg, opts.use_color, opts.timestamp);
+    }
+    let line = format!("{}{}", timestamp_prefix(opts.timestamp), msg);
+    broadcast_log(web_log, line.clone());
+    if let Some(save) = save {
+        let _ = save.write_line(&line);
+    }
+}
+
+/// Print a line in bold red: decoded output can no longer be trusted.
+fn alarm_line(msg: &str, use_color: bool, timestamp: bool) {
+    let msg = format!("{}{}", timestamp_prefix(timestamp), msg);
+    if use_color {
+        println!(
+            "{BOLD}{RED}{msg}{RESET}",
+            BOLD = color::BOLD,
+            RED = color::RED,
+            RESET = color::RESET
+        );
+    } else {
+        println!("{msg}");
+    }
+}
+
 fn warn_line(msg: &str, use_color: bool, timestamp: bool) {
     let msg = format!("{}{}", timestamp_prefix(timestamp), msg);
     if use_color {
